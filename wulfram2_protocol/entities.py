@@ -1,10 +1,11 @@
 """
-Entity type definitions, weapon enums, and behavior slot indices.
+Entity type definitions, shared vehicle helpers, and behavior slot indices.
 """
 
 from enum import IntEnum
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import math
 
 
 class BehaviorSlot(IntEnum):
@@ -218,6 +219,162 @@ def tank_low_speed_mobility_factor(current_speed: float, speed_threshold: float)
             return 1.0
         return factor
     return 1.0
+
+
+def tank_altitude_mobility_factor(normalized_altitude_deviation: float) -> float:
+    """Return the tank altitude mobility factor from a normalized hover deviation.
+
+    `azurefishy-src` `Tank_compute_mobility_factors` applies this branch after
+    slope reduction:
+
+    - deviation <= 1.0: no penalty
+    - excess above 1.0 capped to 0.4
+    - factor = (0.4 - excess) / 0.4
+    - floor factor at 0.35
+
+    The original runtime gets `normalized_altitude_deviation` from the tank
+    vehicle instance / spring state. The public Python runtime does not yet
+    carry that full softbody state, so callers must supply the closest
+    available normalized hover deviation.
+    """
+    if normalized_altitude_deviation <= 1.0:
+        return 1.0
+    excess = normalized_altitude_deviation - 1.0
+    if excess >= 0.4:
+        return 0.35
+    factor = (0.4 - excess) / 0.4
+    if factor < 0.35:
+        return 0.35
+    if factor > 1.0:
+        return 1.0
+    return factor
+
+
+def vehicle_runtime_speed(vel_x: float, vel_y: float, vel_z: float, *, up_axis: str = "z") -> float:
+    """Approximate the runtime entity speed scalar used by vehicle controllers.
+
+    `azurefishy-src` reads tank/scout mobility speed from `entity+0xD4`, which is
+    a scalar speed state rather than a direct raw Vec3 magnitude. The public
+    runtime still lacks that exact field, but a persistent planar speed state is
+    a closer stand-in than feeding controller mobility from full 3D velocity,
+    especially on uneven terrain where vertical hover response should not fully
+    count as forward ground speed.
+    """
+    if up_axis == "y":
+        return math.sqrt(vel_x * vel_x + vel_z * vel_z)
+    return math.sqrt(vel_x * vel_x + vel_y * vel_y)
+
+
+def tank_suspension_sample_offsets(
+    heading: float,
+    *,
+    longitudinal: float,
+    lateral: float,
+) -> tuple[tuple[float, float], ...]:
+    """Return four heading-aligned terrain sample offsets for the tank footprint.
+
+    The original tank controller gets altitude deviation and terrain contact
+    direction from the active softbody/spring state. The public runtime does
+    not yet carry that full state, so a four-point footprint sample is the
+    closest cheap stand-in for the spring corner queries performed before
+    `Tank_compute_mobility_factors()` and `TankVehicle_apply_physics()`.
+    """
+    cos_h = math.cos(heading)
+    sin_h = math.sin(heading)
+    forward = (cos_h, sin_h)
+    right = (-sin_h, cos_h)
+    samples = (
+        (longitudinal, lateral),
+        (longitudinal, -lateral),
+        (-longitudinal, lateral),
+        (-longitudinal, -lateral),
+    )
+    return tuple(
+        (
+            forward_dist * forward[0] + lateral_dist * right[0],
+            forward_dist * forward[1] + lateral_dist * right[1],
+        )
+        for forward_dist, lateral_dist in samples
+    )
+
+
+def terrain_aligned_basis(
+    dh_dx: float,
+    dh_dy: float,
+    heading: float,
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    """Build a terrain-aligned local basis that preserves the given heading.
+
+    This mirrors the decompile shape more closely than a heading-plus-pitch
+    shortcut: movement is rotated by the tank's full terrain-aligned body
+    basis, not just by heading with a separately sampled pitch angle.
+    """
+    def _normalize3(v: tuple[float, float, float], fallback: tuple[float, float, float]) -> tuple[float, float, float]:
+        mag_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+        if mag_sq <= 1e-10:
+            return fallback
+        inv_mag = 1.0 / math.sqrt(mag_sq)
+        return (v[0] * inv_mag, v[1] * inv_mag, v[2] * inv_mag)
+
+    def _dot3(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+    def _cross3(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+        return (
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        )
+
+    up = _normalize3((-dh_dx, -dh_dy, 1.0), (0.0, 0.0, 1.0))
+    planar_forward = (math.cos(heading), math.sin(heading), 0.0)
+    forward_dot = _dot3(planar_forward, up)
+    forward_tangent = (
+        planar_forward[0] - up[0] * forward_dot,
+        planar_forward[1] - up[1] * forward_dot,
+        planar_forward[2] - up[2] * forward_dot,
+    )
+    forward = _normalize3(forward_tangent, planar_forward)
+    right = _normalize3(
+        _cross3(up, forward),
+        (-math.sin(heading), math.cos(heading), 0.0),
+    )
+    forward = _normalize3(_cross3(right, up), forward)
+    return forward, right, up
+
+
+def tank_terrain_contact_coupling(
+    move_x: float,
+    move_y: float,
+    contact_x: float,
+    contact_y: float,
+    max_ground_speed: float = 64.8,
+) -> tuple[float, float, float]:
+    """Apply the decompile-shaped tank terrain-contact coupling in XY.
+
+    The original reads `contact_x/contact_y` from the active spring/softbody
+    state. The public runtime can reuse the exact coupling math even when the
+    contact vector is only an approximation.
+
+    Returns `(new_move_x, new_move_y, normalized_contact_speed)`.
+    """
+    ground_contact_mag = math.sqrt(contact_x * contact_x + contact_y * contact_y)
+    if ground_contact_mag <= 0.1 or max_ground_speed <= 0.0:
+        return move_x, move_y, 0.0
+
+    normalized_speed = ground_contact_mag / max_ground_speed
+    if normalized_speed > 1.0:
+        normalized_speed = 1.0
+
+    scale = normalized_speed / ground_contact_mag
+    contact_x *= scale
+    contact_y *= scale
+    coupling_strength = abs((move_x * contact_x + move_y * contact_y) * normalized_speed)
+    return (
+        move_x + contact_x * coupling_strength,
+        move_y + contact_y * coupling_strength,
+        normalized_speed,
+    )
 
 
 # Per-vehicle-type configs used by the shared runtime
