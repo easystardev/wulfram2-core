@@ -221,6 +221,43 @@ def tank_low_speed_mobility_factor(current_speed: float, speed_threshold: float)
     return 1.0
 
 
+def tank_slope_mobility_factor(
+    slope_component: float,
+    throttle: float,
+    max_velocity: float,
+) -> float:
+    """Return the tank slope-based forward mobility penalty.
+
+    `azurefishy-src` `Tank_compute_mobility_factors` (Vehicles.c:1148-1161):
+
+    - `slope_component` is the forward-direction terrain slope (positive = uphill
+      when moving forward). In the decompile this comes from dot(rotated_up, X).
+    - Only penalizes when moving uphill (same sign for slope and throttle).
+    - If |slope| > max_velocity threshold, compute excess ratio and reduce
+      mobility multiplicatively.
+    - Penalty cap is 0.2 of the threshold, below which mobility reaches 0.
+    """
+    if max_velocity <= 0.0:
+        return 1.0
+    # Only penalize uphill movement
+    if not ((slope_component > 0.0 and throttle > 0.0) or
+            (slope_component < 0.0 and throttle < 0.0)):
+        return 1.0
+    abs_slope = abs(slope_component)
+    if abs_slope <= max_velocity:
+        return 1.0
+    slope_excess = (abs_slope - max_velocity) / max_velocity
+    penalty_cap = 0.2
+    if slope_excess > penalty_cap:
+        slope_excess = penalty_cap
+    factor = (penalty_cap - slope_excess) / penalty_cap
+    if factor < 0.0:
+        return 0.0
+    if factor > 1.0:
+        return 1.0
+    return factor
+
+
 def tank_altitude_mobility_factor(normalized_altitude_deviation: float) -> float:
     """Return the tank altitude mobility factor from a normalized hover deviation.
 
