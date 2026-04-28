@@ -287,6 +287,58 @@ def tank_altitude_mobility_factor(normalized_altitude_deviation: float) -> float
     return factor
 
 
+def tank_hover_clearance_target(terrain_height_offset: float, max_altitude: float) -> float:
+    """Return the tank spring rest clearance above raw terrain height.
+
+    `TankController_update` writes `terrain_base_offset + max_altitude` into the
+    active spring state before `Spring_update_world_state` derives the altitude
+    ratio used by mobility and suspension. Keep this helper shared so server and
+    Python prediction normalize rough-terrain clearance the same way.
+    """
+    target = float(terrain_height_offset) + float(max_altitude)
+    if target <= 0.001:
+        return 0.001
+    return target
+
+
+def tank_suspension_lift_accel(
+    avg_clearance: float,
+    target_clearance: float,
+    vertical_velocity: float,
+    *,
+    stiffness: float = 60.0,
+    damping: float = 1.5,
+    lift_cap: float = 120.0,
+) -> float:
+    """Approximate the tank spring's upward acceleration contribution.
+
+    The exact client path samples piecewise spring curves per corner. The clone
+    still uses a compact controller model, so this supplies the missing
+    upward-only support force from the same averaged clearance state already
+    used for terrain mobility. This is intentionally experimental/opt-in: live
+    OG telemetry shows center-height spring lift can overcorrect authoritative Z
+    until the real BEHAVIOR softbody point data and piecewise curve are cloned.
+    Gravity remains responsible for pulling an over-height tank back down.
+    """
+    if target_clearance <= 0.0 or lift_cap <= 0.0:
+        return 0.0
+    clearance_error = target_clearance - avg_clearance
+    if clearance_error <= 0.0 and vertical_velocity >= 0.0:
+        return 0.0
+
+    lift = 0.0
+    if clearance_error > 0.0 and stiffness > 0.0:
+        lift += clearance_error * stiffness
+    if vertical_velocity < 0.0 and damping > 0.0:
+        lift += -vertical_velocity * damping
+
+    if lift < 0.0:
+        return 0.0
+    if lift > lift_cap:
+        return lift_cap
+    return lift
+
+
 def vehicle_runtime_speed(vel_x: float, vel_y: float, vel_z: float, *, up_axis: str = "z") -> float:
     """Approximate the runtime entity speed scalar used by vehicle controllers.
 
