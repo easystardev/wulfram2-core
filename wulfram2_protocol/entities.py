@@ -287,15 +287,17 @@ def tank_altitude_mobility_factor(normalized_altitude_deviation: float) -> float
     return factor
 
 
-def tank_hover_clearance_target(terrain_height_offset: float, max_altitude: float) -> float:
+def tank_hover_clearance_target(spring_base_offset: float, max_altitude: float) -> float:
     """Return the tank spring rest clearance above raw terrain height.
 
-    `TankController_update` writes `terrain_base_offset + max_altitude` into the
+    `TankController_update` writes `_DAT_005730c4 + max_altitude` into the
     active spring state before `Spring_update_world_state` derives the altitude
-    ratio used by mobility and suspension. Keep this helper shared so server and
-    Python prediction normalize rough-terrain clearance the same way.
+    ratio used by mobility and suspension. `_DAT_005730c4` is a computed
+    collision-radius baseline, not the terrain heightmap Z offset. Keep this
+    helper shared so server and Python prediction normalize rough-terrain
+    clearance the same way.
     """
-    target = float(terrain_height_offset) + float(max_altitude)
+    target = float(spring_base_offset) + float(max_altitude)
     if target <= 0.001:
         return 0.001
     return target
@@ -306,7 +308,7 @@ def tank_suspension_lift_accel(
     target_clearance: float,
     vertical_velocity: float,
     *,
-    stiffness: float = 60.0,
+    stiffness: float = 40.0,
     damping: float = 1.5,
     lift_cap: float = 120.0,
 ) -> float:
@@ -315,10 +317,9 @@ def tank_suspension_lift_accel(
     The exact client path samples piecewise spring curves per corner. The clone
     still uses a compact controller model, so this supplies the missing
     upward-only support force from the same averaged clearance state already
-    used for terrain mobility. This is intentionally experimental/opt-in: live
-    OG telemetry shows center-height spring lift can overcorrect authoritative Z
-    until the real BEHAVIOR softbody point data and piecewise curve are cloned.
-    Gravity remains responsible for pulling an over-height tank back down.
+    used for terrain mobility. The default stiffness follows the decompiled
+    uniform SpringParam initializer (40). Gravity remains responsible for
+    pulling an over-height tank back down.
     """
     if target_clearance <= 0.0 or lift_cap <= 0.0:
         return 0.0
