@@ -209,11 +209,16 @@ class JumpJetConfig:
 
 # Custom extension, not part of the original Tank controller. The runtime gates
 # use behind WULFRAM_JUMP_JETS so default clone physics remains OG-focused.
+#
+# The first 15u/s tank impulse technically fired but only peaked around 1.6u
+# above the ground under the clone's normal gravity/damping, which is easy to
+# miss in OG and Python cameras. The opt-in extension uses a larger impulse so
+# a successful jump is observable without changing default clone physics.
 JUMP_JET_SPAWN_LOCKOUT = 2.0
 JUMP_JET_CONFIGS = {
-    EntityType.TANK: JumpJetConfig(impulse=15.0, cooldown=3.0, fuel_cost=10.0, max_altitude=50.0),
-    EntityType.SCOUT: JumpJetConfig(impulse=20.0, cooldown=2.0, fuel_cost=8.0, max_altitude=50.0),
-    EntityType.ASSAULT_PLATFORM: JumpJetConfig(impulse=10.0, cooldown=5.0, fuel_cost=15.0, max_altitude=50.0),
+    EntityType.TANK: JumpJetConfig(impulse=45.0, cooldown=3.0, fuel_cost=10.0, max_altitude=50.0),
+    EntityType.SCOUT: JumpJetConfig(impulse=55.0, cooldown=2.0, fuel_cost=8.0, max_altitude=55.0),
+    EntityType.ASSAULT_PLATFORM: JumpJetConfig(impulse=35.0, cooldown=5.0, fuel_cost=15.0, max_altitude=45.0),
 }
 
 
