@@ -4,7 +4,7 @@ Entity type definitions, shared vehicle helpers, and behavior slot indices.
 
 from enum import IntEnum
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 import math
 
 
@@ -335,6 +335,19 @@ def tank_hover_clearance_target(spring_base_offset: float, max_altitude: float) 
     return target
 
 
+def tank_spring_average_clearance(sum_clearance: float, point_count: int) -> float:
+    """Return the decompile-shaped spring clearance aggregate.
+
+    `Spring_update_world_state` accumulates per-point height-above-terrain
+    values and stores `height_sum / (point_count - 1)` at spring offset +0x78.
+    For the 4-point tank quad this means the aggregate is intentionally
+    `sum / 3`, not the arithmetic mean `sum / 4`.
+    """
+    if point_count <= 1:
+        return float(sum_clearance)
+    return float(sum_clearance) / float(point_count - 1)
+
+
 def tank_suspension_lift_accel(
     avg_clearance: float,
     target_clearance: float,
@@ -387,29 +400,90 @@ def vehicle_runtime_speed(vel_x: float, vel_y: float, vel_z: float, *, up_axis: 
     return math.sqrt(vel_x * vel_x + vel_y * vel_y)
 
 
+def tank_spring_local_offsets(
+    spring_states: object,
+    *,
+    state_index: int = 0,
+) -> tuple[tuple[float, float], ...] | None:
+    """Extract the first four local XY spring points from BEHAVIOR Section 5.
+
+    `Spring_update_world_state` transforms local SpringState positions through
+    the entity rotation matrix, and then `Spring_compute_suspension_forces`
+    indexes points 0-3 as a quad. This helper intentionally accepts generic
+    objects so the shared protocol layer does not depend on the client parser
+    dataclasses.
+    """
+    if spring_states is None:
+        return None
+
+    states = spring_states
+    if hasattr(states, "points"):
+        state = states
+    else:
+        try:
+            if len(states) <= state_index:  # type: ignore[arg-type]
+                return None
+            state = states[state_index]  # type: ignore[index]
+        except (TypeError, IndexError):
+            return None
+
+    points = getattr(state, "points", state)
+    try:
+        if len(points) < 4:  # type: ignore[arg-type]
+            return None
+    except TypeError:
+        return None
+
+    offsets = []
+    for point in points[:4]:  # type: ignore[index]
+        pos = getattr(point, "pos", point)
+        try:
+            offsets.append((float(pos[0]), float(pos[1])))
+        except (TypeError, IndexError, ValueError):
+            return None
+    return tuple(offsets)
+
+
+def tank_suspension_local_sample_offsets(
+    *,
+    longitudinal: float,
+    lateral: float,
+    local_offsets: Sequence[tuple[float, float]] | None = None,
+) -> tuple[tuple[float, float], ...]:
+    """Return the four tank-local spring sample points used for terrain queries."""
+    if local_offsets is not None and len(local_offsets) >= 4:
+        return tuple((float(x), float(y)) for x, y in local_offsets[:4])
+    return (
+        (float(longitudinal), float(lateral)),
+        (float(longitudinal), -float(lateral)),
+        (-float(longitudinal), float(lateral)),
+        (-float(longitudinal), -float(lateral)),
+    )
+
+
 def tank_suspension_sample_offsets(
     heading: float,
     *,
     longitudinal: float,
     lateral: float,
+    local_offsets: Sequence[tuple[float, float]] | None = None,
 ) -> tuple[tuple[float, float], ...]:
     """Return four heading-aligned terrain sample offsets for the tank footprint.
 
     The original tank controller gets altitude deviation and terrain contact
-    direction from the active softbody/spring state. The public runtime does
-    not yet carry that full state, so a four-point footprint sample is the
-    closest cheap stand-in for the spring corner queries performed before
-    `Tank_compute_mobility_factors()` and `TankVehicle_apply_physics()`.
+    direction from the active softbody/spring state loaded from BEHAVIOR
+    Section 5. If parsed local offsets are available, use the same first-four
+    spring points that the decompile indexes as a quad; otherwise fall back to
+    the older radius-derived approximation.
     """
     cos_h = math.cos(heading)
     sin_h = math.sin(heading)
     forward = (cos_h, sin_h)
     right = (-sin_h, cos_h)
-    samples = (
-        (longitudinal, lateral),
-        (longitudinal, -lateral),
-        (-longitudinal, lateral),
-        (-longitudinal, -lateral),
+    samples = tank_suspension_local_sample_offsets(
+        longitudinal=longitudinal,
+        lateral=lateral,
+        local_offsets=local_offsets,
     )
     return tuple(
         (
