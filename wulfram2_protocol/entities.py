@@ -18,9 +18,10 @@ class BehaviorSlot(IntEnum):
     TURNING = 1          # yaw (left/right)
     MOVING_FORWARD = 2   # W/S
     MOVING_SIDEWAYS = 3  # A/D
-    # NOTE: Slot 4 is NOT control-quantized in network packets.
-    # Current compatibility handling keeps slot 4 on the non-quantized/raw path.
-    WEAPON_SELECT = 4
+    # Empirical OG probe 2026-04-28: action_key "jumpjet" sets slot 4.
+    # Slot 4 is not control-quantized in ACTION_UPDATE/ACTION_DUMP.
+    JUMPJET = 4
+    WEAPON_SELECT = 4      # Legacy alias; weapon hotkeys use direct slots 12-19.
     UPWARD_THRUST = 5    # Q/Z relative axis (encoded with zoom quantizer)
     SLOT6 = 6            # Unknown (control quantizer)
     SLOT7 = 7            # Unknown (control quantizer)
@@ -183,10 +184,11 @@ class VehiclePhysicsConfig:
     turn_adjust: float      # angular acceleration multiplier
     move_adjust: float      # forward acceleration multiplier
     strafe_adjust: float    # strafe acceleration multiplier
-    max_velocity: float     # velocity clamp
-    low_fuel_level: float   # retained compatibility field name
+    max_velocity: float     # velocity clamp / slope threshold
+    low_fuel_level: float   # fuel threshold below which tank mobility is reduced
     max_altitude: float     # max hover height
     gravity_pct: float      # gravity multiplier (1.0 = normal)
+    max_fuel: float = 33000.0
 
     # Runtime physics
     linear_damping_driving: float = 0.8   # ground_friction * terrain_scale (flat ground)
@@ -195,30 +197,55 @@ class VehiclePhysicsConfig:
     mass: float = 1.0                     # runtime mass scalar
 
 
-def tank_low_speed_mobility_factor(current_speed: float, speed_threshold: float) -> float:
-    """Return the tank forward-mobility cap from current speed.
+@dataclass(frozen=True)
+class JumpJetConfig:
+    """Opt-in custom jump-jet tuning shared by server and Python prediction."""
 
-    The compatibility path applies:
-      factor = (current_speed / speed_threshold) * 0.6 + 0.4
-    when speed is below the threshold, otherwise 1.0.
+    impulse: float = 15.0
+    cooldown: float = 3.0
+    fuel_cost: float = 10.0
+    max_altitude: float = 50.0
 
-    `azurefishy-src` still leaves the exact runtime meaning of controller
-    `+0x30` ambiguous in this path. Current empirical sync captures say the
-    older speed-threshold interpretation remains closer than reusing
-    `max_velocity` directly.
+
+# Custom extension, not part of the original Tank controller. The runtime gates
+# use behind WULFRAM_JUMP_JETS so default clone physics remains OG-focused.
+JUMP_JET_SPAWN_LOCKOUT = 2.0
+JUMP_JET_CONFIGS = {
+    EntityType.TANK: JumpJetConfig(impulse=15.0, cooldown=3.0, fuel_cost=10.0, max_altitude=50.0),
+    EntityType.SCOUT: JumpJetConfig(impulse=20.0, cooldown=2.0, fuel_cost=8.0, max_altitude=50.0),
+    EntityType.ASSAULT_PLATFORM: JumpJetConfig(impulse=10.0, cooldown=5.0, fuel_cost=15.0, max_altitude=50.0),
+}
+
+
+def tank_fuel_mobility_factor(current_fuel: float, low_fuel_level: float) -> float:
+    """Return the tank forward-mobility cap from current fuel.
+
+    `Tank_compute_mobility_factors` gates forward mobility on entity+0xD4.
+    Live wulftap probes show that field is fuel/max-fuel state, not speed.
+    The client only applies the 0.4-1.0 ramp when fuel is below the
+    `low_fuel_level` BEHAVIOR value.
     """
-    if speed_threshold <= 0.0:
+    if low_fuel_level <= 0.0:
         return 1.0
-    if current_speed < 0.0:
-        current_speed = 0.0
-    if current_speed < speed_threshold:
-        factor = (current_speed / speed_threshold) * 0.6 + 0.4
+    if current_fuel < 0.0:
+        current_fuel = 0.0
+    if current_fuel < low_fuel_level:
+        factor = (current_fuel / low_fuel_level) * 0.6 + 0.4
         if factor < 0.4:
             return 0.4
         if factor > 1.0:
             return 1.0
         return factor
     return 1.0
+
+
+def tank_low_speed_mobility_factor(current_speed: float, speed_threshold: float) -> float:
+    """Deprecated compatibility wrapper for older callers.
+
+    The original name came from an early decompile comment that misidentified
+    entity+0xD4 as speed. Use `tank_fuel_mobility_factor` for clone logic.
+    """
+    return tank_fuel_mobility_factor(current_speed, speed_threshold)
 
 
 def tank_slope_mobility_factor(
