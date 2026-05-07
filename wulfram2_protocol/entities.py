@@ -4,7 +4,7 @@ Entity type definitions, shared vehicle helpers, and behavior slot indices.
 
 from enum import IntEnum
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 import math
 
 
@@ -432,6 +432,7 @@ OG_TANK_SOFTBODY_IDLE_SLOT5 = 0.824
 OG_TANK_SOFTBODY_Q_SLOT5 = 1.0071
 OG_TANK_SOFTBODY_Z_SLOT5 = 0.05
 OG_TANK_SOFTBODY_POINT_COUNT = 4
+OG_PHYSICS_TIMESTEP_FACTOR = 100.0
 
 
 @dataclass(frozen=True)
@@ -459,12 +460,307 @@ class TankSoftbodyForce:
     force_offset: float
 
 
+@dataclass(frozen=True)
+class TankSpringAttitudeStep:
+    """Integrated tank spring pitch/roll attitude response."""
+
+    roll: float
+    pitch: float
+    roll_velocity: float
+    pitch_velocity: float
+    target_roll: float
+    target_pitch: float
+    roll_error: float
+    pitch_error: float
+    roll_torque: float
+    pitch_torque: float
+    stiffness: float
+    damping: float
+    dt: float
+
+
+@dataclass(frozen=True)
+class TankSpringForceAttitudeStep:
+    """Integrated tank spring pitch/roll response from per-point force torque."""
+
+    roll: float
+    pitch: float
+    roll_velocity: float
+    pitch_velocity: float
+    local_torque_x: float
+    local_torque_y: float
+    roll_torque: float
+    pitch_torque: float
+    point_forces: tuple[float, ...]
+    total_lift: float
+    torque_scale: float
+    damping: float
+    dt: float
+
+
+def _short_angle_delta(target: float, current: float) -> float:
+    """Return the shortest signed delta from current to target in radians."""
+    delta = (float(target) - float(current) + math.pi) % (2.0 * math.pi) - math.pi
+    if delta <= -math.pi:
+        delta += 2.0 * math.pi
+    return delta
+
+
+def tank_spring_attitude_step(
+    current_roll: float,
+    current_pitch: float,
+    target_roll: float,
+    target_pitch: float,
+    roll_velocity: float,
+    pitch_velocity: float,
+    dt: float,
+    *,
+    stiffness: float = 40.0,
+    damping: float = 2.0,
+) -> TankSpringAttitudeStep:
+    """Step the tank spring's pitch/roll attitude toward its target.
+
+    `Spring_compute_suspension_forces` does not set entity pitch/roll directly:
+    it accumulates pitch/roll torque, and `Spring_apply_forces_to_entity` adds
+    that torque to the entity angular velocity. This helper keeps the public
+    Python runtimes on that shape while the full per-point force curve is still
+    being ported. Defaults use the recovered uniform spring stiffness (`40`)
+    and the runtime angular damping from `VehiclePhysicsConfig`.
+    """
+    step_dt = max(0.0, float(dt))
+    spring_k = max(0.0, float(stiffness))
+    spring_damp = max(0.0, float(damping))
+    cur_roll = float(current_roll)
+    cur_pitch = float(current_pitch)
+    vel_roll = float(roll_velocity)
+    vel_pitch = float(pitch_velocity)
+
+    roll_error = _short_angle_delta(target_roll, cur_roll)
+    pitch_error = _short_angle_delta(target_pitch, cur_pitch)
+    roll_torque = spring_k * roll_error - spring_damp * vel_roll
+    pitch_torque = spring_k * pitch_error - spring_damp * vel_pitch
+
+    if step_dt > 0.0:
+        vel_roll += roll_torque * step_dt
+        vel_pitch += pitch_torque * step_dt
+        cur_roll = (cur_roll + vel_roll * step_dt) % (2.0 * math.pi)
+        cur_pitch = (cur_pitch + vel_pitch * step_dt) % (2.0 * math.pi)
+
+    return TankSpringAttitudeStep(
+        roll=cur_roll,
+        pitch=cur_pitch,
+        roll_velocity=vel_roll,
+        pitch_velocity=vel_pitch,
+        target_roll=float(target_roll),
+        target_pitch=float(target_pitch),
+        roll_error=float(roll_error),
+        pitch_error=float(pitch_error),
+        roll_torque=float(roll_torque),
+        pitch_torque=float(pitch_torque),
+        stiffness=float(spring_k),
+        damping=float(spring_damp),
+        dt=float(step_dt),
+    )
+
+
+def _matrix3_from_euler_xyz_shared(ex: float, ey: float, ez: float) -> tuple[float, ...]:
+    """Build the row-major XYZ rotation matrix used by the decompiled client."""
+    cx = math.cos(ex)
+    sx = math.sin(ex)
+    cy = math.cos(ey)
+    sy = math.sin(ey)
+    cz = math.cos(ez)
+    sz = math.sin(ez)
+    return (
+        cz * cy,
+        cz * sy * sx - sz * cx,
+        sz * sx + cz * cx * sy,
+        sz * cy,
+        sy * sx * sz + cz * cx,
+        sy * cx * sz - cz * sx,
+        -sy,
+        cy * sx,
+        cx * cy,
+    )
+
+
+def tank_body_matrix_drive_basis(
+    heading: float,
+    *,
+    roll: float = 0.0,
+    pitch: float = 0.0,
+    rotation_matrix: Sequence[float] | None = None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Return TankVehicle_apply_physics' body-rotated forward/right basis.
+
+    The decompiled tank drive path builds a local movement vector with
+    `move_vec_z = 0`, then rotates that vector by the entity Euler/body matrix
+    before applying the move-adjust cap. Once the clone has live spring-derived
+    body pitch/roll, using the body matrix is the decompile-backed path; the
+    older flat-yaw basis remains useful only as an explicit debug fallback.
+    """
+    matrix = (
+        tuple(float(v) for v in rotation_matrix[:9])
+        if rotation_matrix is not None and len(rotation_matrix) >= 9
+        else _matrix3_from_euler_xyz_shared(float(roll), float(pitch), float(heading))
+    )
+    # Local +X is forward, local +Y is right in the same row-major matrix shape
+    # used by Spring_update_world_state.
+    forward = (matrix[0], matrix[3], matrix[6])
+    right = (matrix[1], matrix[4], matrix[7])
+    return forward, right
+
+
+def _sample_float(sample: Mapping[str, object], key: str, default: float = 0.0) -> float:
+    try:
+        return float(sample.get(key, default))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _sample_pair(
+    sample: Mapping[str, object],
+    key: str,
+    default: tuple[float, float] = (0.0, 0.0),
+) -> tuple[float, float]:
+    value = sample.get(key)
+    try:
+        return (float(value[0]), float(value[1]))  # type: ignore[index]
+    except (TypeError, IndexError, ValueError):
+        return default
+
+
+def tank_spring_force_attitude_step(
+    current_roll: float,
+    current_pitch: float,
+    heading: float,
+    samples: Sequence[Mapping[str, object]],
+    roll_velocity: float,
+    pitch_velocity: float,
+    dt: float,
+    total_lift: float,
+    *,
+    damping: float = 2.0,
+) -> TankSpringForceAttitudeStep:
+    """Step tank pitch/roll from per-point suspension force torque.
+
+    The OG spring path does not directly snap the entity to the accumulated
+    terrain normal. `Spring_compute_suspension_forces` samples a force per
+    spring point, applies that force along the spring point normal, computes
+    force-vs-lever torque, then zeroes yaw torque. This helper ports that
+    shape with the public runtime's existing vertical lift as the total force
+    budget while the exact piecewise curve is still being recovered.
+    """
+    step_dt = max(0.0, float(dt))
+    lift = max(0.0, float(total_lift))
+    spring_damp = max(0.0, float(damping))
+    cur_roll = float(current_roll)
+    cur_pitch = float(current_pitch)
+    vel_roll = float(roll_velocity)
+    vel_pitch = float(pitch_velocity)
+
+    clean_samples = list(samples[:4])
+    point_count = len(clean_samples)
+    if lift <= 0.0 or point_count <= 0:
+        roll_torque = -spring_damp * vel_roll
+        pitch_torque = -spring_damp * vel_pitch
+        if step_dt > 0.0:
+            vel_roll += roll_torque * step_dt
+            vel_pitch += pitch_torque * step_dt
+            cur_roll = (cur_roll + vel_roll * step_dt) % (2.0 * math.pi)
+            cur_pitch = (cur_pitch + vel_pitch * step_dt) % (2.0 * math.pi)
+        return TankSpringForceAttitudeStep(
+            roll=cur_roll,
+            pitch=cur_pitch,
+            roll_velocity=vel_roll,
+            pitch_velocity=vel_pitch,
+            local_torque_x=0.0,
+            local_torque_y=0.0,
+            roll_torque=roll_torque,
+            pitch_torque=pitch_torque,
+            point_forces=tuple(0.0 for _ in clean_samples),
+            total_lift=lift,
+            torque_scale=0.0,
+            damping=spring_damp,
+            dt=step_dt,
+        )
+
+    clearances = [max(0.5, _sample_float(sample, "clearance", 0.5)) for sample in clean_samples]
+    # Lower/compressed points receive a larger share of the existing vertical
+    # support. This mirrors the piecewise force curve's height blend without
+    # inventing a separate vertical target.
+    weights = [1.0 / clearance for clearance in clearances]
+    weight_sum = sum(weights)
+    if weight_sum <= 1e-9:
+        point_forces = tuple(lift / float(point_count) for _ in clean_samples)
+    else:
+        point_forces = tuple(lift * weight / weight_sum for weight in weights)
+
+    matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
+    # BEHAVIOR Section 5 currently emits allocator-default local normals
+    # `(0, 0, -1)`. The force kernel negates the magnitude, so the effective
+    # world force is along the body up column.
+    force_dir = (matrix[2], matrix[5], matrix[8])
+
+    local_torque_x = 0.0
+    local_torque_y = 0.0
+    for sample, force_mag in zip(clean_samples, point_forces):
+        world_x, world_y = _sample_pair(sample, "world_offset")
+        lever_x = float(world_x)
+        lever_y = float(world_y)
+        lever_z = _sample_float(sample, "world_offset_z", 0.0)
+        force_x = force_dir[0] * force_mag
+        force_y = force_dir[1] * force_mag
+        force_z = force_dir[2] * force_mag
+        # Decompile order: force x lever, then inverse-transform to local.
+        world_torque_x = force_z * lever_y - force_y * lever_z
+        world_torque_y = force_x * lever_z - lever_x * force_z
+        world_torque_z = lever_x * force_y - force_x * lever_y
+        local_torque_x += (
+            matrix[6] * world_torque_z
+            + matrix[0] * world_torque_x
+            + matrix[3] * world_torque_y
+        )
+        local_torque_y += (
+            matrix[7] * world_torque_z
+            + matrix[1] * world_torque_x
+            + matrix[4] * world_torque_y
+        )
+
+    torque_scale = 1.0 / max(lift, 1.0)
+    roll_torque = local_torque_x * torque_scale - spring_damp * vel_roll
+    pitch_torque = local_torque_y * torque_scale - spring_damp * vel_pitch
+
+    if step_dt > 0.0:
+        vel_roll += roll_torque * step_dt
+        vel_pitch += pitch_torque * step_dt
+        cur_roll = (cur_roll + vel_roll * step_dt) % (2.0 * math.pi)
+        cur_pitch = (cur_pitch + vel_pitch * step_dt) % (2.0 * math.pi)
+
+    return TankSpringForceAttitudeStep(
+        roll=cur_roll,
+        pitch=cur_pitch,
+        roll_velocity=vel_roll,
+        pitch_velocity=vel_pitch,
+        local_torque_x=float(local_torque_x),
+        local_torque_y=float(local_torque_y),
+        roll_torque=float(roll_torque),
+        pitch_torque=float(pitch_torque),
+        point_forces=tuple(float(v) for v in point_forces),
+        total_lift=lift,
+        torque_scale=float(torque_scale),
+        damping=spring_damp,
+        dt=step_dt,
+    )
+
+
 def tank_softbody_suspension_force(
     average_height: float,
     vertical_velocity: float,
     slot5: float,
     *,
     gravity: float = -50.0,
+    physics_timestep_factor: float = OG_PHYSICS_TIMESTEP_FACTOR,
     max_altitude: float = 3.25,
     gravity_pct: float = 1.0,
     force_offset: float = 0.0,
@@ -485,8 +781,9 @@ def tank_softbody_suspension_force(
     - keep slot 5 as the softbody stiffness/vehicle throttle input written
       into the spring state before Spring_compute_suspension_forces;
     - feed that stiffness into the force response path as the decompile does
-      (`stiffness * max_altitude + shear + force_offset`), compressing the
-      missing piecewise curve into a bounded effective flat-height equilibrium;
+      (`stiffness * max_altitude + shear + force_offset`), using the BEHAVIOR
+      physics timestep factor as the spring's base force term while gravity is
+      still applied by the rigid-body tick;
     - produce a spring-force contribution, not a direct Q/Z vertical impulse;
     - leave the legacy compact target path available for blocker probes.
     """
@@ -498,7 +795,9 @@ def tank_softbody_suspension_force(
     base_target = max(0.001, float(target_average_height))
     gravity_factor = max(0.0, float(gravity_pct))
 
-    support = abs(float(gravity)) * gravity_factor
+    support = max(0.0, float(physics_timestep_factor)) * gravity_factor
+    if support <= 0.0:
+        support = abs(float(gravity)) * gravity_factor
     idle = max(0.001, abs(float(idle_slot5)))
     # Spring_compute_suspension_forces samples the jet/spring curve with
     # stiffness * max_altitude plus shear and force_offset. A direct additive
@@ -645,6 +944,43 @@ def tank_spring_local_offsets(
     return tuple(offsets)
 
 
+def tank_spring_local_points(
+    spring_states: object,
+    *,
+    state_index: int = 0,
+) -> tuple[tuple[float, float, float], ...] | None:
+    """Extract the first four local XYZ spring points from BEHAVIOR Section 5."""
+    if spring_states is None:
+        return None
+
+    states = spring_states
+    if hasattr(states, "points"):
+        state = states
+    else:
+        try:
+            if len(states) <= state_index:  # type: ignore[arg-type]
+                return None
+            state = states[state_index]  # type: ignore[index]
+        except (TypeError, IndexError):
+            return None
+
+    points = getattr(state, "points", state)
+    try:
+        if len(points) < 4:  # type: ignore[arg-type]
+            return None
+    except TypeError:
+        return None
+
+    offsets = []
+    for point in points[:4]:  # type: ignore[index]
+        pos = getattr(point, "pos", point)
+        try:
+            offsets.append((float(pos[0]), float(pos[1]), float(pos[2])))
+        except (TypeError, IndexError, ValueError):
+            return None
+    return tuple(offsets)
+
+
 def tank_suspension_local_sample_offsets(
     *,
     longitudinal: float,
@@ -660,6 +996,24 @@ def tank_suspension_local_sample_offsets(
         (-float(longitudinal), float(lateral)),
         (-float(longitudinal), -float(lateral)),
     )
+
+
+def tank_suspension_local_sample_points(
+    *,
+    longitudinal: float,
+    lateral: float,
+    local_points: Sequence[tuple[float, float, float]] | None = None,
+    local_offsets: Sequence[tuple[float, float]] | None = None,
+) -> tuple[tuple[float, float, float], ...]:
+    """Return the four tank-local spring sample points used by OG spring state."""
+    if local_points is not None and len(local_points) >= 4:
+        return tuple((float(x), float(y), float(z)) for x, y, z in local_points[:4])
+    offsets = tank_suspension_local_sample_offsets(
+        longitudinal=longitudinal,
+        lateral=lateral,
+        local_offsets=local_offsets,
+    )
+    return tuple((x, y, 0.0) for x, y in offsets)
 
 
 def tank_suspension_sample_offsets(
@@ -692,6 +1046,52 @@ def tank_suspension_sample_offsets(
             forward_dist * forward[1] + lateral_dist * right[1],
         )
         for forward_dist, lateral_dist in samples
+    )
+
+
+def tank_suspension_world_sample_offsets(
+    heading: float,
+    *,
+    longitudinal: float,
+    lateral: float,
+    local_points: Sequence[tuple[float, float, float]] | None = None,
+    local_offsets: Sequence[tuple[float, float]] | None = None,
+    rotation_matrix: Sequence[float] | None = None,
+) -> tuple[tuple[float, float, float], ...]:
+    """Return decompile-shaped rotated spring sample offsets.
+
+    `Spring_update_world_state` multiplies each local SpringState point by the
+    entity rotation matrix before querying terrain constraints. The older clone
+    sampler used only heading-aligned XY offsets, which loses the per-point Z
+    offset created by body pitch/roll.
+    """
+    samples = tank_suspension_local_sample_points(
+        longitudinal=longitudinal,
+        lateral=lateral,
+        local_points=local_points,
+        local_offsets=local_offsets,
+    )
+    if rotation_matrix is None:
+        cos_h = math.cos(heading)
+        sin_h = math.sin(heading)
+        rotation_matrix = (
+            cos_h, -sin_h, 0.0,
+            sin_h, cos_h, 0.0,
+            0.0, 0.0, 1.0,
+        )
+    return tuple(
+        (
+            local_z * float(rotation_matrix[2])
+            + local_x * float(rotation_matrix[0])
+            + local_y * float(rotation_matrix[1]),
+            local_z * float(rotation_matrix[5])
+            + local_x * float(rotation_matrix[3])
+            + local_y * float(rotation_matrix[4]),
+            local_z * float(rotation_matrix[8])
+            + local_x * float(rotation_matrix[6])
+            + local_y * float(rotation_matrix[7]),
+        )
+        for local_x, local_y, local_z in samples
     )
 
 
@@ -740,18 +1140,21 @@ def terrain_aligned_basis(
     return forward, right, up
 
 
+TANK_TERRAIN_CONTACT_NORMALIZER = math.sin(math.radians(49.5))
+
+
 def tank_terrain_contact_coupling(
     move_x: float,
     move_y: float,
     contact_x: float,
     contact_y: float,
-    max_ground_speed: float = 64.8,
+    max_ground_speed: float = TANK_TERRAIN_CONTACT_NORMALIZER,
 ) -> tuple[float, float, float]:
     """Apply the decompile-shaped tank terrain-contact coupling in XY.
 
-    The original reads `contact_x/contact_y` from the active spring/softbody
-    state. The public runtime can reuse the exact coupling math even when the
-    contact vector is only an approximation.
+    The original reads `contact_x/contact_y` directly from the active
+    spring/softbody state and normalizes their magnitude by the tank global
+    `_DAT_005d5ea8 = sin(49.5deg)`.
 
     Returns `(new_move_x, new_move_y, normalized_contact_speed)`.
     """
