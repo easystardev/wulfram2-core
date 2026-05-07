@@ -22,11 +22,48 @@ class BehaviorSlot(IntEnum):
     # Slot 4 is not control-quantized in ACTION_UPDATE/ACTION_DUMP.
     JUMPJET = 4
     WEAPON_SELECT = 4      # Legacy alias; weapon hotkeys use direct slots 12-19.
-    UPWARD_THRUST = 5    # Q/Z relative axis (encoded with zoom quantizer)
-    SLOT6 = 6            # Unknown (control quantizer)
+    UPWARD_THRUST = 5    # Live OG Q/Z softbody throttle/stiffness (zoom quantizer)
+    SLOT6 = 6            # Raw axis 6 / visual lean (control quantizer)
     SLOT7 = 7            # Unknown (control quantizer)
     FIRE = 8             # Primary fire trigger (binary)
     # Slots 9-21 are various other controls
+
+
+TANK_SOFTBODY_CONTROL_SLOT = BehaviorSlot.UPWARD_THRUST
+
+
+def tank_softbody_control_slot_value(
+    behavior_slots: Sequence[float],
+    *,
+    default: float = 0.824,
+    allow_legacy_slot6: bool = False,
+) -> float:
+    """Return the live OG Q/Z softbody throttle/stiffness slot value.
+
+    Decompile-backed controller flow writes input axis 5 into the tank vehicle
+    throttle, then copies that value into the active softbody stiffness field.
+    Live wulftap Q/Z telemetry confirms decoded behavior slot 5 follows that
+    vehicle_throttle/softbody_stiffness value, while slot 6 is raw-axis lean.
+    Slot 6 is live OG raw-axis lean data, so it must not drive suspension in
+    normal server/client paths. Older local harnesses may opt into that
+    compatibility fallback explicitly.
+    """
+    try:
+        primary = float(behavior_slots[int(BehaviorSlot.UPWARD_THRUST)])
+    except (IndexError, TypeError, ValueError):
+        primary = 0.0
+    if abs(primary) > 0.001:
+        return primary
+
+    if allow_legacy_slot6:
+        try:
+            legacy = float(behavior_slots[int(BehaviorSlot.SLOT6)])
+        except (IndexError, TypeError, ValueError):
+            legacy = 0.0
+        if abs(legacy) > 0.001:
+            return legacy
+
+    return float(default)
 
 
 # Shared slot classification for ACTION_DUMP/ACTION_UPDATE encoding.
@@ -37,6 +74,7 @@ ACTION_ANALOG_SLOTS = frozenset({
     BehaviorSlot.MOVING_FORWARD,
     BehaviorSlot.MOVING_SIDEWAYS,
     BehaviorSlot.UPWARD_THRUST,
+    TANK_SOFTBODY_CONTROL_SLOT,
     BehaviorSlot.SLOT6,
     BehaviorSlot.SLOT7,
 })
@@ -191,8 +229,8 @@ class VehiclePhysicsConfig:
     max_fuel: float = 33000.0
 
     # Runtime physics
-    linear_damping_driving: float = 0.8   # ground_friction * terrain_scale (flat ground)
-    linear_damping_coasting: float = 2.0  # coasting / no-throttle path
+    linear_damping_driving: float = 1.5   # active PhysicsConfig linear damping
+    linear_damping_coasting: float = 1.5  # same coefficient while coasting
     angular_damping: float = 2.0          # runtime angular damping
     mass: float = 1.0                     # runtime mass scalar
 
@@ -383,6 +421,169 @@ def tank_suspension_lift_accel(
     if lift > lift_cap:
         return lift_cap
     return lift
+
+
+OG_TANK_SOFTBODY_REST_HEIGHT = 13.0636
+# Live OG after BEHAVIOR Section 5 emits the allocator-default down normals
+# for each tank spring point. The earlier 2.4785 reading came from a malformed
+# zero-normal BEHAVIOR payload and made both OG and server hug the low hover.
+OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT = 4.342
+OG_TANK_SOFTBODY_IDLE_SLOT5 = 0.824
+OG_TANK_SOFTBODY_Q_SLOT5 = 1.0071
+OG_TANK_SOFTBODY_Z_SLOT5 = 0.05
+OG_TANK_SOFTBODY_POINT_COUNT = 4
+
+
+@dataclass(frozen=True)
+class TankSoftbodyForce:
+    """Result from the decompile-shaped tank softbody vertical force stand-in."""
+
+    model: str
+    lift_accel: float
+    support_accel: float
+    height_response_accel: float
+    damping_accel: float
+    average_height: float
+    target_average_height: float
+    height_error: float
+    height_ratio: float
+    slot5: float
+    force_curve_input: float
+    force_bias_accel: float
+    vehicle_throttle: float
+    softbody_stiffness: float
+    response_scale: float
+    gravity_pct: float
+    rest_height: float
+    max_altitude: float
+    force_offset: float
+
+
+def tank_softbody_suspension_force(
+    average_height: float,
+    vertical_velocity: float,
+    slot5: float,
+    *,
+    gravity: float = -50.0,
+    max_altitude: float = 3.25,
+    gravity_pct: float = 1.0,
+    force_offset: float = 0.0,
+    rest_height: float = OG_TANK_SOFTBODY_REST_HEIGHT,
+    target_average_height: float = OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT,
+    idle_slot5: float = OG_TANK_SOFTBODY_IDLE_SLOT5,
+    damping: float = 6.0,
+) -> TankSoftbodyForce:
+    """Approximate the OG tank softbody's vertical spring-force path.
+
+    The old compact helper treated `rest_height + max_altitude` as a center
+    lift target. Live wulftap shows the OG softbody at rest instead reports a
+    four-point Spring_update_world_state average height around 2.48u and keeps
+    gravity supported there. This helper mirrors the decompile shape relevant
+    to flat terrain:
+
+    - operate on Spring_update_world_state's averaged per-point height;
+    - keep slot 5 as the softbody stiffness/vehicle throttle input written
+      into the spring state before Spring_compute_suspension_forces;
+    - feed that stiffness into the force response path as the decompile does
+      (`stiffness * max_altitude + shear + force_offset`), compressing the
+      missing piecewise curve into a bounded effective flat-height equilibrium;
+    - produce a spring-force contribution, not a direct Q/Z vertical impulse;
+    - leave the legacy compact target path available for blocker probes.
+    """
+    avg = float(average_height)
+    vel = float(vertical_velocity)
+    throttle = max(0.0, min(1.2, float(slot5)))
+    rest = max(0.001, float(rest_height))
+    max_alt = max(0.001, float(max_altitude))
+    base_target = max(0.001, float(target_average_height))
+    gravity_factor = max(0.0, float(gravity_pct))
+
+    support = abs(float(gravity)) * gravity_factor
+    idle = max(0.001, abs(float(idle_slot5)))
+    # Spring_compute_suspension_forces samples the jet/spring curve with
+    # stiffness * max_altitude plus shear and force_offset. A direct additive
+    # interpretation only changes Q by about 0.6u/s^2 against 50u/s^2 gravity,
+    # which live OG reports as no visible hover-height control. The curve's
+    # flat-terrain effect is an equilibrium shift: idle maps to the observed
+    # flat average height, Q raises that equilibrium, and Z lowers it. The
+    # lower bound stays above the terrain-height clamp so Z is a low hover, not
+    # a request to drive the body through the ground.
+    force_curve_input = max(0.0, throttle * max_alt + float(force_offset))
+    idle_force_curve_input = max(0.001, idle * max_alt + float(force_offset))
+    input_ratio = force_curve_input / idle_force_curve_input
+    target_floor = max(0.5, base_target * 0.5)
+    target_ceiling = base_target + max_alt
+    target = base_target * input_ratio
+    if target < target_floor:
+        target = target_floor
+    elif target > target_ceiling:
+        target = target_ceiling
+    # Slot 5 still affects response gain, but the original piecewise curve has
+    # base force terms, so a low Z slot should not make the spring completely
+    # unresponsive.
+    response_scale = max(0.4, throttle / idle)
+    height_error = target - avg
+    height_response = height_error * (support / max_alt) * response_scale
+    force_bias_accel = (target - base_target) * (support / max_alt) * response_scale
+    damping_accel = -vel * max(0.0, float(damping))
+
+    lift = support + height_response + damping_accel
+    if lift < 0.0:
+        lift = 0.0
+    # Keep the stand-in bounded like the original per-frame spring contribution
+    # while allowing a firm response from terrain contact.
+    lift_cap = max(support * 2.4, support + max_alt * (support / max_alt) * 2.0)
+    if lift > lift_cap:
+        lift = lift_cap
+
+    return TankSoftbodyForce(
+        model="softbody_empirical_flat",
+        lift_accel=float(lift),
+        support_accel=float(support),
+        height_response_accel=float(height_response),
+        damping_accel=float(damping_accel),
+        average_height=avg,
+        target_average_height=target,
+        height_error=float(height_error),
+        height_ratio=avg / rest,
+        slot5=float(throttle),
+        force_curve_input=float(force_curve_input),
+        force_bias_accel=float(force_bias_accel),
+        vehicle_throttle=float(throttle),
+        softbody_stiffness=float(throttle),
+        response_scale=float(response_scale),
+        gravity_pct=float(gravity_factor),
+        rest_height=float(rest),
+        max_altitude=float(max_alt),
+        force_offset=float(force_offset),
+    )
+
+
+def tank_softbody_horizontal_damping(
+    linear_damp: float,
+    contact_damp: float,
+    slot5: float,
+    *,
+    idle_slot5: float = OG_TANK_SOFTBODY_IDLE_SLOT5,
+) -> tuple[float, float]:
+    """Return planar damping for the tank softbody's current hover setting.
+
+    Live OG Q+W telemetry shows high hover uses the normal PhysicsConfig
+    linear damping (`1.5`), reaching roughly 29u/s with the recovered W impulse.
+    The heavier contact damping is only appropriate for the low Z/ground-hugging
+    hover state.
+    """
+    base = max(0.0, float(linear_damp))
+    contact = max(0.0, float(contact_damp))
+    if contact <= base:
+        return base, 0.0
+    try:
+        control = float(slot5)
+    except (TypeError, ValueError):
+        control = idle_slot5
+    if control < max(0.001, float(idle_slot5)) * 0.5:
+        return contact, contact
+    return base, 0.0
 
 
 def vehicle_runtime_speed(vel_x: float, vel_y: float, vel_z: float, *, up_axis: str = "z") -> float:

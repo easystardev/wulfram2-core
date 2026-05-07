@@ -23,10 +23,10 @@ SUBSTEP_SPLIT_THRESHOLD = 0.08  # Split to half-step above this
 ANGULAR_DAMP_COEFF = 2.0
 
 # Linear velocity damping
-COASTING_DAMP = 2.0            # coasting / no-throttle path
-DRIVING_DAMP = 0.8             # empirical match - with throttle
-# The public runtime uses 0.8 here because it matches current client behavior
-# more closely than the older exploratory value set.
+COASTING_DAMP = 1.5            # active PhysicsConfig linear damping
+DRIVING_DAMP = 1.5             # same coefficient while driving
+# Live OG memory shows the tank's active PhysicsConfig linear damping at 1.5
+# with the linear-damping flag enabled.
 
 # Softbody damping multiplier
 DAMPING_MULTIPLIER = 1.4137167
@@ -35,7 +35,7 @@ DAMPING_MULTIPLIER = 1.4137167
 # ============ Position / Velocity Limits ============
 
 VEC_POS_MAX = 8192.0           # Position quantizer max (+/-8192 world units)
-STEADY_STATE_SPEED = 64.8      # u/s at full throttle with driving_damp=0.8
+STEADY_STATE_SPEED = 56.7      # u/s at full throttle with driving_damp=1.5
 
 
 # ============ Gravity ============
