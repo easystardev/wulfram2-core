@@ -6,6 +6,7 @@ from enum import IntEnum
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence, Tuple
 import math
+import struct
 
 
 class BehaviorSlot(IntEnum):
@@ -433,6 +434,43 @@ OG_TANK_SOFTBODY_Q_SLOT5 = 1.0071
 OG_TANK_SOFTBODY_Z_SLOT5 = 0.05
 OG_TANK_SOFTBODY_POINT_COUNT = 4
 OG_PHYSICS_TIMESTEP_FACTOR = 100.0
+OG_TANK_SPRING_POINT_NORMAL = (0.0, 0.0, -1.0)
+OG_TANK_FORCE_BASE_REACT = 0.0055
+OG_TANK_FORCE_SLOPE_REACT = 0.003
+OG_TANK_SPRING_SHEAR_STIFFNESS = 40.0
+OG_TANK_JET_ABATE_MAX = 1.5
+OG_TANK_JET_HEIGHT_CURVE = (
+    1.0,
+    0.9985150098800659,
+    0.9939879775047302,
+    0.9842531681060791,
+    0.9710888862609863,
+    0.9583333134651184,
+    0.949999988079071,
+    0.9333333373069763,
+    0.8833333253860474,
+    0.7700000405311584,
+    0.573333203792572,
+    0.30166661739349365,
+    0.009999999776482582,
+)
+OG_TANK_JET_HEIGHT_CONSIDER_CURVE = (
+    0.0,
+    0.0,
+    0.018181825056672096,
+    0.049675341695547104,
+    0.09056279063224792,
+    0.13865803182125092,
+    0.18372297286987305,
+    0.25,
+    0.4284849762916565,
+    0.762056291103363,
+    0.8980087041854858,
+    0.9509091377258301,
+    0.9785570502281189,
+    0.9935714602470398,
+    0.9900000095367432,
+)
 
 
 @dataclass(frozen=True)
@@ -458,6 +496,18 @@ class TankSoftbodyForce:
     rest_height: float
     max_altitude: float
     force_offset: float
+    point_count: int = 0
+    point_forces: tuple[float, ...] = ()
+    point_vertical_forces: tuple[float, ...] = ()
+    point_clearances: tuple[float, ...] = ()
+    point_clamped_heights: tuple[float, ...] = ()
+    point_height_errors: tuple[float, ...] = ()
+    point_normal_z: tuple[float, ...] = ()
+    point_stretch_ratios: tuple[float, ...] = ()
+    point_force_curve_inputs: tuple[float, ...] = ()
+    point_height_curve_factors: tuple[float, ...] = ()
+    point_blend_factors: tuple[float, ...] = ()
+    point_shear_corrections: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -496,6 +546,397 @@ class TankSpringForceAttitudeStep:
     torque_scale: float
     damping: float
     dt: float
+    torque_model: str = "decompile_config"
+    torque_force_scales: tuple[float, ...] = ()
+    integration_model: str = "decompile_impulse"
+    angular_velocity_before: tuple[float, float] = (0.0, 0.0)
+    spring_angular_delta: tuple[float, float] = (0.0, 0.0)
+    angular_velocity_after_spring: tuple[float, float] = (0.0, 0.0)
+    angular_velocity_after_damping: tuple[float, float] = (0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class StaticTerrainConstraintResult:
+    """Result from an OG-shaped static terrain contact constraint solve."""
+
+    position: Tuple[float, float, float]
+    velocity: Tuple[float, float, float]
+    angular_velocity: Tuple[float, float, float]
+    debug: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class EntityInterpolationDecision:
+    """Decision shape for OG Entity_interpolate_toward_target."""
+
+    action: str
+    interp_factor: float
+    position_distance: float
+    rotation_distance: float
+    combined_radius: float
+    tolerance: float
+    elapsed_ticks: float
+    reset_physics: bool
+    wake: bool
+    update_last_interp_tick: bool
+    debug: Mapping[str, object]
+
+
+def _vec3_dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return float(a[0]) * float(b[0]) + float(a[1]) * float(b[1]) + float(a[2]) * float(b[2])
+
+
+def _vec3_cross(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float, float]:
+    return (
+        float(a[1]) * float(b[2]) - float(a[2]) * float(b[1]),
+        float(a[2]) * float(b[0]) - float(a[0]) * float(b[2]),
+        float(a[0]) * float(b[1]) - float(a[1]) * float(b[0]),
+    )
+
+
+def _vec3_len(v: Sequence[float]) -> float:
+    return math.sqrt(_vec3_dot(v, v))
+
+
+def _vec3_normalize(v: Sequence[float]) -> Tuple[float, float, float] | None:
+    length = _vec3_len(v)
+    if length <= 1e-8:
+        return None
+    inv = 1.0 / length
+    return (float(v[0]) * inv, float(v[1]) * inv, float(v[2]) * inv)
+
+
+def mesh_aabb_half_extents_from_vertices(
+    vertices: Sequence[object],
+) -> Optional[Tuple[float, float, float]]:
+    """Return half-extents from the mesh AABB used by OG bounds physics."""
+
+    if not vertices:
+        return None
+
+    def coord(vertex: object, index: int, name: str) -> float:
+        value = getattr(vertex, name, None)
+        if value is None:
+            value = vertex[index]  # type: ignore[index]
+        return float(value)
+
+    xs = [coord(vertex, 0, "x") for vertex in vertices]
+    ys = [coord(vertex, 1, "y") for vertex in vertices]
+    zs = [coord(vertex, 2, "z") for vertex in vertices]
+    return (
+        (max(xs) - min(xs)) * 0.5,
+        (max(ys) - min(ys)) * 0.5,
+        (max(zs) - min(zs)) * 0.5,
+    )
+
+
+def _decompile_mesh_bounds_inertia_diagonal(
+    mass: float,
+    half_extents: Sequence[float],
+) -> Tuple[float, float, float]:
+    """Return the diagonal inertia stored by CollisionMesh_compute_bounds_physics.
+
+    The decompile writes inertia from full AABB extents as products of squared
+    side lengths. The Python collision caches expose half-extents, so expand
+    them back to full extents here.
+    """
+
+    hx = max(0.001, float(half_extents[0]))
+    hy = max(0.001, float(half_extents[1]))
+    hz = max(0.001, float(half_extents[2]))
+    ex = hx * 2.0
+    ey = hy * 2.0
+    ez = hz * 2.0
+    body_mass = max(0.001, float(mass))
+    return (
+        (ey * ey * ez * ez * body_mass) / 12.0,
+        (ex * ex * ez * ez * body_mass) / 12.0,
+        (ex * ex * ey * ey * body_mass) / 12.0,
+    )
+
+
+def _directional_inertia(
+    torque_axis: Sequence[float],
+    inertia_diagonal: Sequence[float],
+) -> float:
+    """Mirror Physics_calc_inertia_magnitude for a diagonal tensor."""
+
+    torque_len = _vec3_len(torque_axis)
+    ix = max(0.001, float(inertia_diagonal[0]))
+    iy = max(0.001, float(inertia_diagonal[1]))
+    iz = max(0.001, float(inertia_diagonal[2]))
+    if torque_len <= 0.001:
+        return (ix + iy + iz) / 3.0
+    ux = float(torque_axis[0]) / torque_len
+    uy = float(torque_axis[1]) / torque_len
+    uz = float(torque_axis[2]) / torque_len
+    return math.sqrt(ix * ux * ux + iy * uy * uy + iz * uz * uz)
+
+
+def solve_static_terrain_constraint(
+    *,
+    position: Sequence[float],
+    velocity: Sequence[float],
+    angular_velocity: Sequence[float] = (0.0, 0.0, 0.0),
+    contact_point: Sequence[float],
+    contact_normal: Sequence[float],
+    penetration: float,
+    half_extents: Sequence[float],
+    inertia_half_extents: Sequence[float] | None = None,
+    inertia_diagonal: Sequence[float] | None = None,
+    mass: float = 6700.0,
+    friction: float = 0.2,
+    terrain_friction: float = 1.0,
+    dynamic_friction_enabled: bool = True,
+    body_should_sleep: bool = False,
+    body_is_sleeping: bool = False,
+    terrain_should_sleep: bool = False,
+    constraint_frozen: bool = False,
+    slop: float = 0.005,
+    correction_cap: float = 0.005,
+    target_separation: float = 0.005,
+    constraint_iterations: int = 100,
+    restitution_fraction: float = 0.1,
+) -> StaticTerrainConstraintResult:
+    """Solve a static terrain contact using the decompiled constraint shape.
+
+    This is the static-terrain half of the OG
+    `Constraint_solve_iterative`/`Constraint_apply_friction` path:
+    effective mass is computed at the contact point, normal impulses update
+    both linear and angular velocity, friction uses tangential contact-point
+    velocity, persistent +0xAE sleeping state softens effective mass and
+    applied impulses, and the final 10% restitution impulse follows the
+    decompile. Collision-pair bucketing and interpolation remain in the caller.
+    """
+
+    normal = _vec3_normalize(contact_normal)
+    if normal is None:
+        return StaticTerrainConstraintResult(
+            position=(float(position[0]), float(position[1]), float(position[2])),
+            velocity=(float(velocity[0]), float(velocity[1]), float(velocity[2])),
+            angular_velocity=(
+                float(angular_velocity[0]),
+                float(angular_velocity[1]),
+                float(angular_velocity[2]),
+            ),
+            debug={
+                "response": "terrain_contact_constraint_solver_skipped",
+                "reason": "degenerate normal",
+            },
+        )
+
+    body_mass = max(0.001, float(mass))
+    body_friction_coeff = max(0.0, float(friction))
+    terrain_friction_coeff = max(0.0, float(terrain_friction))
+    pair_friction_coeff = min(body_friction_coeff, terrain_friction_coeff)
+    body_is_sleeping_flag = bool(body_is_sleeping)
+    constraint_frozen_flag = bool(constraint_frozen)
+    if body_is_sleeping_flag and constraint_frozen_flag:
+        effective_mass_sleep_scale = 0.0
+        impulse_sleep_scale = 0.0
+    elif body_is_sleeping_flag:
+        effective_mass_sleep_scale = 0.5
+        impulse_sleep_scale = 0.5
+    else:
+        effective_mass_sleep_scale = 1.0
+        impulse_sleep_scale = 1.0
+    dynamic_friction_active = (
+        bool(dynamic_friction_enabled)
+        and not bool(body_should_sleep)
+        and not bool(terrain_should_sleep)
+    )
+    if not bool(dynamic_friction_enabled):
+        friction_skip_reason = "dynamic_friction_disabled"
+    elif bool(body_should_sleep) or bool(terrain_should_sleep):
+        friction_skip_reason = "should_sleep_flag"
+    elif pair_friction_coeff <= 0.0:
+        friction_skip_reason = "nonpositive_pair_friction"
+    else:
+        friction_skip_reason = None
+    inertia_model = "provided_diagonal"
+    if inertia_diagonal is None:
+        inertia_extents = inertia_half_extents if inertia_half_extents is not None else half_extents
+        inertia_diagonal = _decompile_mesh_bounds_inertia_diagonal(body_mass, inertia_extents)
+        inertia_model = "decompile_mesh_bounds_full_extents"
+    inertia_diagonal = (
+        float(inertia_diagonal[0]),
+        float(inertia_diagonal[1]),
+        float(inertia_diagonal[2]),
+    )
+    pos = [float(position[0]), float(position[1]), float(position[2])]
+    vel = [float(velocity[0]), float(velocity[1]), float(velocity[2])]
+    ang = [
+        float(angular_velocity[0]),
+        float(angular_velocity[1]),
+        float(angular_velocity[2]),
+    ]
+    point = (float(contact_point[0]), float(contact_point[1]), float(contact_point[2]))
+    lever = (point[0] - pos[0], point[1] - pos[1], point[2] - pos[2])
+
+    correction_limit = max(0.0, min(0.5, float(correction_cap)))
+    penetration_correction = max(0.0, float(penetration) - float(slop))
+    position_correction = min(penetration_correction, correction_limit)
+    pos[0] += normal[0] * position_correction
+    pos[1] += normal[1] * position_correction
+    pos[2] += normal[2] * position_correction
+
+    def point_velocity() -> Tuple[float, float, float]:
+        rotational = _vec3_cross(ang, lever)
+        return (
+            vel[0] + rotational[0],
+            vel[1] + rotational[1],
+            vel[2] + rotational[2],
+        )
+
+    def effective_mass(direction: Sequence[float]) -> Tuple[float, float, Tuple[float, float, float]]:
+        torque = _vec3_cross(lever, direction)
+        inertia = _directional_inertia(torque, inertia_diagonal)
+        if body_is_sleeping_flag and constraint_frozen_flag:
+            return 0.0, inertia, torque
+        double_cross = _vec3_cross(torque, lever)
+        angular_term = _vec3_dot(direction, double_cross) / max(inertia, 1e-8)
+        effective = (1.0 / body_mass) + max(0.0, angular_term)
+        return effective * effective_mass_sleep_scale, inertia, torque
+
+    def apply_impulse(direction: Sequence[float], impulse: float) -> Tuple[float, float, float]:
+        torque = _vec3_cross(lever, direction)
+        if body_is_sleeping_flag and constraint_frozen_flag:
+            return torque
+        impulse = float(impulse) * impulse_sleep_scale
+        inertia = _directional_inertia(torque, inertia_diagonal)
+        linear_scale = impulse / body_mass
+        angular_scale = impulse / max(inertia, 1e-8)
+        vel[0] += float(direction[0]) * linear_scale
+        vel[1] += float(direction[1]) * linear_scale
+        vel[2] += float(direction[2]) * linear_scale
+        ang[0] += torque[0] * angular_scale
+        ang[1] += torque[1] * angular_scale
+        ang[2] += torque[2] * angular_scale
+        return torque
+
+    pv_before = point_velocity()
+    center_normal_before = _vec3_dot(vel, normal)
+    point_normal_before = _vec3_dot(pv_before, normal)
+    eff_normal_initial, inertia_normal_initial, torque_normal = effective_mass(normal)
+    accumulated_normal_impulse = 0.0
+    total_friction_impulse = 0.0
+    max_friction_impulse = 0.0
+    normal_iterations = 0
+    friction_iterations = 0
+    min_correction_threshold = 0.005
+    iteration_limit = max(1, min(100, int(constraint_iterations)))
+
+    for iteration in range(1, iteration_limit + 1):
+        pv = point_velocity()
+        separation_speed = _vec3_dot(pv, normal)
+        if separation_speed >= float(target_separation):
+            break
+        correction = float(target_separation) - separation_speed
+        if min_correction_threshold < correction:
+            correction = (correction * float(iteration)) / 500.0
+        if correction < min_correction_threshold:
+            correction = min_correction_threshold
+
+        eff_normal, _inertia_normal, _torque = effective_mass(normal)
+        if eff_normal <= 1e-8:
+            break
+        normal_impulse = correction / eff_normal
+        apply_impulse(normal, normal_impulse)
+        accumulated_normal_impulse += normal_impulse
+        normal_iterations += 1
+
+        pv = point_velocity()
+        normal_component = _vec3_dot(pv, normal)
+        tangent = (
+            pv[0] - normal[0] * normal_component,
+            pv[1] - normal[1] * normal_component,
+            pv[2] - normal[2] * normal_component,
+        )
+        tangent_speed = _vec3_len(tangent)
+        if tangent_speed >= 0.001 and dynamic_friction_active and pair_friction_coeff > 0.0:
+            tangent_dir = (
+                tangent[0] / tangent_speed,
+                tangent[1] / tangent_speed,
+                tangent[2] / tangent_speed,
+            )
+            eff_tangent, _inertia_tangent, _torque_tangent = effective_mass(tangent_dir)
+            if eff_tangent > 1e-8:
+                friction_impulse = -(
+                    pair_friction_coeff * _vec3_dot(pv, tangent_dir)
+                ) / eff_tangent
+                apply_impulse(tangent_dir, friction_impulse)
+                total_friction_impulse += friction_impulse
+                max_friction_impulse = max(max_friction_impulse, abs(friction_impulse))
+                friction_iterations += 1
+
+        min_correction_threshold += 0.0001
+
+    restitution_impulse = 0.0
+    if accumulated_normal_impulse > 0.0001 and float(restitution_fraction) > 0.0:
+        restitution_impulse = accumulated_normal_impulse * float(restitution_fraction)
+        apply_impulse(normal, restitution_impulse)
+
+    pv_after = point_velocity()
+    center_normal_after = _vec3_dot(vel, normal)
+    point_normal_after = _vec3_dot(pv_after, normal)
+    normal_linear_delta = center_normal_after - center_normal_before
+    angular_delta = (
+        ang[0] - float(angular_velocity[0]),
+        ang[1] - float(angular_velocity[1]),
+        ang[2] - float(angular_velocity[2]),
+    )
+    debug = {
+        "response": "terrain_contact_constraint_solver",
+        "constraint_model": "decompile_static_terrain_sequential_impulse",
+        "position_correction": position_correction,
+        "position_correction_cap": correction_limit,
+        "normal_velocity_before": center_normal_before,
+        "point_normal_velocity_before": point_normal_before,
+        "point_normal_velocity_after": point_normal_after,
+        "normal_delta": normal_linear_delta,
+        "target_separation": float(target_separation),
+        "effective_mass_normal": eff_normal_initial,
+        "normal_inertia": inertia_normal_initial,
+        "normal_torque": torque_normal,
+        "normal_impulse": accumulated_normal_impulse,
+        "normal_iterations": normal_iterations,
+        "friction_coeff": float(friction),
+        "friction_model": "decompile_constraint_apply_friction_min_pair",
+        "body_friction_coeff": body_friction_coeff,
+        "terrain_friction_coeff": terrain_friction_coeff,
+        "pair_friction_coeff": pair_friction_coeff,
+        "dynamic_friction_enabled": bool(dynamic_friction_enabled),
+        "body_should_sleep": bool(body_should_sleep),
+        "body_is_sleeping": body_is_sleeping_flag,
+        "terrain_should_sleep": bool(terrain_should_sleep),
+        "constraint_frozen": constraint_frozen_flag,
+        "effective_mass_sleep_scale": effective_mass_sleep_scale,
+        "impulse_sleep_scale": impulse_sleep_scale,
+        "friction_skip_reason": friction_skip_reason,
+        "friction_impulse": total_friction_impulse,
+        "friction_impulse_abs_max": max_friction_impulse,
+        "friction_iterations": friction_iterations,
+        "restitution_fraction": float(restitution_fraction),
+        "restitution_impulse": restitution_impulse,
+        "contact_lever": lever,
+        "inertia_diagonal": inertia_diagonal,
+        "inertia_model": inertia_model,
+        "angular_velocity_before": (
+            float(angular_velocity[0]),
+            float(angular_velocity[1]),
+            float(angular_velocity[2]),
+        ),
+        "angular_velocity_after": (ang[0], ang[1], ang[2]),
+        "angular_delta": angular_delta,
+        "point_velocity_before": pv_before,
+        "point_velocity_after": pv_after,
+    }
+    return StaticTerrainConstraintResult(
+        position=(pos[0], pos[1], pos[2]),
+        velocity=(vel[0], vel[1], vel[2]),
+        angular_velocity=(ang[0], ang[1], ang[2]),
+        debug=debug,
+    )
 
 
 def _short_angle_delta(target: float, current: float) -> float:
@@ -504,6 +945,172 @@ def _short_angle_delta(target: float, current: float) -> float:
     if delta <= -math.pi:
         delta += 2.0 * math.pi
     return delta
+
+
+def entity_interp_factor(delta_seconds: float) -> float:
+    """Mirror Entity_calc_interp_factor from the decompile."""
+
+    delta = max(0.0, float(delta_seconds))
+    if delta > 0.2:
+        return 0.0
+    if delta < 0.04:
+        return 1.0
+    return ((1.0 / delta) - 5.0) / 20.0
+
+
+def _u32_tick_as_float(tick: int) -> float:
+    value = int(tick)
+    if value < 0:
+        value += 4294967296
+    return float(value & 0xFFFFFFFF)
+
+
+def entity_interpolate_toward_target_decision(
+    *,
+    current_position: Sequence[float],
+    target_position: Sequence[float] | None,
+    current_rotation: Sequence[float],
+    target_rotation: Sequence[float] | None,
+    tolerance: float,
+    combined_radius: float,
+    current_tick: int,
+    last_interp_tick: int,
+    delta_seconds: float,
+    wake_override: bool = False,
+    debug_curve_enabled: bool = False,
+    rotation_distance: float | None = None,
+) -> EntityInterpolationDecision:
+    """Evaluate the decompiled Entity_interpolate_toward_target decision.
+
+    The exact OG rotation metric comes from FPU state left by
+    `Euler_compose_rotations`; callers can pass that value when observed. The
+    fallback uses wrapped per-axis distance so the threshold shape remains
+    inspectable until the FPU metric is recovered.
+    """
+
+    interp_factor = entity_interp_factor(delta_seconds)
+    tol = float(tolerance)
+    radius = float(combined_radius)
+    elapsed_ticks = _u32_tick_as_float(current_tick) - _u32_tick_as_float(last_interp_tick)
+
+    base_debug = {
+        "entity_interpolation_model": "decompile_entity_interpolate_toward_target",
+        "interp_factor": interp_factor,
+        "delta_seconds": float(delta_seconds),
+        "tolerance": tol,
+        "combined_radius": radius,
+        "current_tick": int(current_tick),
+        "last_interp_tick": int(last_interp_tick),
+        "elapsed_ticks": elapsed_ticks,
+        "wake_override": bool(wake_override),
+        "debug_curve_enabled": bool(debug_curve_enabled),
+    }
+
+    if debug_curve_enabled:
+        return EntityInterpolationDecision(
+            action="skip_debug_curve",
+            interp_factor=interp_factor,
+            position_distance=0.0,
+            rotation_distance=0.0,
+            combined_radius=radius,
+            tolerance=tol,
+            elapsed_ticks=elapsed_ticks,
+            reset_physics=False,
+            wake=False,
+            update_last_interp_tick=False,
+            debug={**base_debug, "interpolation_action": "skip_debug_curve"},
+        )
+
+    if wake_override:
+        return EntityInterpolationDecision(
+            action="wake_forced",
+            interp_factor=interp_factor,
+            position_distance=0.0,
+            rotation_distance=0.0,
+            combined_radius=radius,
+            tolerance=tol,
+            elapsed_ticks=elapsed_ticks,
+            reset_physics=False,
+            wake=True,
+            update_last_interp_tick=False,
+            debug={**base_debug, "interpolation_action": "wake_forced"},
+        )
+
+    if target_position is None or target_rotation is None:
+        return EntityInterpolationDecision(
+            action="target_unavailable",
+            interp_factor=interp_factor,
+            position_distance=0.0,
+            rotation_distance=0.0,
+            combined_radius=radius,
+            tolerance=tol,
+            elapsed_ticks=elapsed_ticks,
+            reset_physics=False,
+            wake=False,
+            update_last_interp_tick=False,
+            debug={**base_debug, "interpolation_action": "target_unavailable"},
+        )
+
+    pos_distance = (
+        abs(float(target_position[0]) - float(current_position[0]))
+        + abs(float(target_position[1]) - float(current_position[1]))
+        + abs(float(target_position[2]) - float(current_position[2]))
+    )
+    rotation_model = "provided"
+    if rotation_distance is None:
+        rotation_distance = (
+            abs(_short_angle_delta(float(target_rotation[0]), float(current_rotation[0])))
+            + abs(_short_angle_delta(float(target_rotation[1]), float(current_rotation[1])))
+            + abs(_short_angle_delta(float(target_rotation[2]), float(current_rotation[2])))
+        )
+        rotation_model = "wrapped_axis_manhattan_fallback"
+    rot_distance = float(rotation_distance)
+
+    position_gate = pos_distance * interp_factor < tol + 0.03
+    rotation_gate = rot_distance * interp_factor < (tol / 100.0) + 0.006
+    radius_gate = radius * interp_factor < (tol * 1.4) + 1.3
+    reset_gate = elapsed_ticks > interp_factor * 12.0
+
+    debug = {
+        **base_debug,
+        "position_distance": pos_distance,
+        "rotation_distance": rot_distance,
+        "rotation_distance_model": rotation_model,
+        "position_gate": position_gate,
+        "rotation_gate": rotation_gate,
+        "radius_gate": radius_gate,
+        "reset_tick_threshold": interp_factor * 12.0,
+        "reset_gate": reset_gate,
+    }
+    if position_gate and rotation_gate and radius_gate:
+        if reset_gate:
+            action = "reset_physics"
+            reset_physics = True
+            wake = False
+        else:
+            action = "wake_without_tick_update"
+            reset_physics = False
+            wake = True
+        update_last_interp_tick = False
+    else:
+        action = "wake_update_last_interp_tick"
+        reset_physics = False
+        wake = True
+        update_last_interp_tick = True
+
+    return EntityInterpolationDecision(
+        action=action,
+        interp_factor=interp_factor,
+        position_distance=pos_distance,
+        rotation_distance=rot_distance,
+        combined_radius=radius,
+        tolerance=tol,
+        elapsed_ticks=elapsed_ticks,
+        reset_physics=reset_physics,
+        wake=wake,
+        update_last_interp_tick=update_last_interp_tick,
+        debug={**debug, "interpolation_action": action},
+    )
 
 
 def tank_spring_attitude_step(
@@ -584,6 +1191,151 @@ def _matrix3_from_euler_xyz_shared(ex: float, ey: float, ez: float) -> tuple[flo
     )
 
 
+def _f32_shared(value: float) -> float:
+    return struct.unpack("f", struct.pack("f", float(value)))[0]
+
+
+_F32_TWO_PI = _f32_shared(6.2831855)
+
+
+def _normalize_angle_positive_shared(angle: float) -> float:
+    out = _f32_shared(angle)
+    if out > 20000.0 or out < -20000.0:
+        return 0.0
+    while out < 0.0:
+        out = _f32_shared(out + _F32_TWO_PI)
+    while out > _F32_TWO_PI:
+        out = _f32_shared(out - _F32_TWO_PI)
+    return out
+
+
+def _matrix3_from_axis_angle_shared(
+    omega_x: float,
+    omega_y: float,
+    omega_z: float,
+) -> tuple[float, ...]:
+    angle_sq = omega_x * omega_x + omega_y * omega_y + omega_z * omega_z
+    angle_f64 = math.sqrt(angle_sq)
+    angle = _f32_shared(angle_f64)
+    if angle < 1e-05:
+        return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+    inv_len = _f32_shared(1.0 / angle)
+    nx = _f32_shared(omega_x * inv_len)
+    ny = _f32_shared(omega_y * inv_len)
+    nz = _f32_shared(omega_z * inv_len)
+    c = _f32_shared(math.cos(angle_f64))
+    s = _f32_shared(math.sin(angle_f64))
+    t = _f32_shared(1.0 - c)
+    t_nx = _f32_shared(nx * t)
+    t_ny = _f32_shared(ny * t)
+    t_nz = _f32_shared(nz * t)
+
+    return (
+        _f32_shared(_f32_shared(nx * t_nx) + c),
+        _f32_shared(_f32_shared(ny * t_nx) + _f32_shared(nz * s)),
+        _f32_shared(_f32_shared(t_nx * nz) - _f32_shared(ny * s)),
+        _f32_shared(_f32_shared(t_ny * nx) - _f32_shared(nz * s)),
+        _f32_shared(_f32_shared(ny * t_ny) + c),
+        _f32_shared(_f32_shared(t_ny * nz) + _f32_shared(nx * s)),
+        _f32_shared(_f32_shared(nx * t_nz) + _f32_shared(ny * s)),
+        _f32_shared(_f32_shared(ny * t_nz) - _f32_shared(nx * s)),
+        _f32_shared(_f32_shared(nz * t_nz) + c),
+    )
+
+
+def _extract_euler_angles_shared(matrix: Sequence[float]) -> tuple[float, float, float]:
+    fm0 = _f32_shared(float(matrix[0]))
+    fm1 = _f32_shared(float(matrix[1]))
+    fm3 = _f32_shared(float(matrix[3]))
+    fm6 = _f32_shared(float(matrix[6]))
+    fm7 = _f32_shared(float(matrix[7]))
+    fm8 = _f32_shared(float(matrix[8]))
+    gimbal = math.sqrt(fm0 * fm0 + fm1 * fm1)
+
+    if gimbal <= 1.9073486328125e-06:
+        euler_x = _f32_shared(math.atan2(fm7, fm8))
+        euler_y = _f32_shared(math.atan2(-fm6, gimbal))
+        euler_z = 0.0
+    else:
+        euler_x = _f32_shared(math.atan2(fm7, fm8))
+        euler_y = _f32_shared(math.atan2(-fm6, gimbal))
+        euler_z = _f32_shared(math.atan2(fm3, fm0))
+    return (
+        _normalize_angle_positive_shared(euler_x),
+        _normalize_angle_positive_shared(euler_y),
+        _normalize_angle_positive_shared(euler_z),
+    )
+
+
+def matrix3_integrate_angular_shared(
+    matrix: Sequence[float],
+    angular_velocity: Sequence[float],
+    dt: float,
+    *,
+    angular_damping: float = 0.0,
+) -> tuple[tuple[float, ...], tuple[float, float, float], tuple[float, float, float]]:
+    """Mirror `GUESS5_Matrix3_integrate_angular` for spring body pose.
+
+    The decompile builds an axis-angle delta from angular_velocity * dt,
+    multiplies it into the current matrix using float intermediates, extracts
+    euler angles, then applies damping/acceleration to angular velocity for
+    the next substep.
+    """
+    fdt = _f32_shared(max(0.0, float(dt)))
+    omega = (
+        _f32_shared(float(angular_velocity[0]) * fdt),
+        _f32_shared(float(angular_velocity[1]) * fdt),
+        _f32_shared(float(angular_velocity[2]) * fdt),
+    )
+    delta = _matrix3_from_axis_angle_shared(omega[0], omega[1], omega[2])
+    source = tuple(_f32_shared(float(v)) for v in tuple(matrix)[:9])
+    if len(source) != 9:
+        source = _matrix3_from_euler_xyz_shared(0.0, 0.0, 0.0)
+    d = delta
+    m = source
+
+    r00 = _f32_shared(_f32_shared(_f32_shared(d[2] * m[2]) + _f32_shared(d[0] * m[0])) + _f32_shared(d[1] * m[1]))
+    r01 = _f32_shared(_f32_shared(_f32_shared(d[2] * m[5]) + _f32_shared(d[0] * m[3])) + _f32_shared(d[1] * m[4]))
+    r02 = _f32_shared(_f32_shared(_f32_shared(d[2] * m[8]) + _f32_shared(d[0] * m[6])) + _f32_shared(d[1] * m[7]))
+    r10 = _f32_shared(_f32_shared(_f32_shared(d[5] * m[2]) + _f32_shared(d[3] * m[0])) + _f32_shared(d[4] * m[1]))
+    r11 = _f32_shared(_f32_shared(_f32_shared(d[5] * m[5]) + _f32_shared(d[3] * m[3])) + _f32_shared(d[4] * m[4]))
+    r12 = _f32_shared(_f32_shared(_f32_shared(d[5] * m[8]) + _f32_shared(d[3] * m[6])) + _f32_shared(d[4] * m[7]))
+    r20 = _f32_shared(_f32_shared(_f32_shared(d[8] * m[2]) + _f32_shared(d[6] * m[0])) + _f32_shared(d[7] * m[1]))
+    r21 = _f32_shared(_f32_shared(_f32_shared(d[8] * m[5]) + _f32_shared(d[6] * m[3])) + _f32_shared(d[7] * m[4]))
+    r22 = _f32_shared(_f32_shared(_f32_shared(d[8] * m[8]) + _f32_shared(d[6] * m[6])) + _f32_shared(d[7] * m[7]))
+
+    out_matrix = (
+        float(r00),
+        float(r10),
+        float(r20),
+        float(r01),
+        float(r11),
+        float(r21),
+        float(r02),
+        float(r12),
+        float(r22),
+    )
+    euler = _extract_euler_angles_shared(out_matrix)
+
+    damp = max(0.0, float(angular_damping))
+    if fdt > 0.0 and damp > 0.0:
+        out_velocity = tuple(
+            _f32_shared(
+                float(angular_velocity[i])
+                + _f32_shared(_f32_shared(-float(angular_velocity[i])) * _f32_shared(damp)) * fdt
+            )
+            for i in range(3)
+        )
+    else:
+        out_velocity = (
+            float(angular_velocity[0]),
+            float(angular_velocity[1]),
+            float(angular_velocity[2]),
+        )
+    return out_matrix, euler, out_velocity
+
+
 def tank_body_matrix_drive_basis(
     heading: float,
     *,
@@ -630,6 +1382,206 @@ def _sample_pair(
         return default
 
 
+def _sample_vec3(
+    sample: Mapping[str, object],
+    key: str,
+    default: tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> tuple[float, float, float]:
+    value = sample.get(key)
+    try:
+        return (float(value[0]), float(value[1]), float(value[2]))  # type: ignore[index]
+    except (TypeError, IndexError, ValueError):
+        return default
+
+
+def _spring_sample_world_offset(sample: Mapping[str, object]) -> tuple[float, float, float]:
+    world_x, world_y = _sample_pair(sample, "world_offset")
+    return (world_x, world_y, _sample_float(sample, "world_offset_z", 0.0))
+
+
+def _spring_sample_local_offset(sample: Mapping[str, object]) -> tuple[float, float, float]:
+    local_x, local_y = _sample_pair(sample, "local_offset", _sample_pair(sample, "world_offset"))
+    return (local_x, local_y, 0.0)
+
+
+def _spring_edge_angle(
+    samples: Sequence[Mapping[str, object]],
+    point_a: int,
+    point_b: int,
+) -> float:
+    if point_a >= len(samples) or point_b >= len(samples):
+        return 0.0
+    ax, ay, az = _spring_sample_world_offset(samples[point_a])
+    bx, by, bz = _spring_sample_world_offset(samples[point_b])
+    dx = bx - ax
+    dy = by - ay
+    dz = bz - az
+    length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if length <= 1e-9:
+        return 0.0
+    # Spring_calc_edge_angle uses (z_a - z_b) / segment_length.
+    ratio = max(-1.0, min(1.0, (az - bz) / length))
+    return math.asin(ratio)
+
+
+def _spring_apply_shear_pair(
+    corrections: list[float],
+    samples: Sequence[Mapping[str, object]],
+    point_a: int,
+    point_b: int,
+    reference_a: int,
+    reference_b: int,
+    *,
+    local_axis: int,
+    stiffness: float,
+) -> None:
+    if point_a >= len(samples) or point_b >= len(samples):
+        return
+    local_a = _spring_sample_local_offset(samples[point_a])
+    local_b = _spring_sample_local_offset(samples[point_b])
+    length_component = abs(local_a[local_axis] - local_b[local_axis])
+    if length_component <= 1e-9:
+        return
+    angle = _spring_edge_angle(samples, point_a, point_b)
+    reference_angle = _spring_edge_angle(samples, reference_a, reference_b)
+    # The decompiled helper has the shape `sin(angle_a) -
+    # tan(angle_b)*cos(angle_a)`. That expression is zero when paired edges have
+    # the same angle and produces an asymmetric point correction when the spring
+    # quad twists.
+    reference_angle = max(math.radians(-80.0), min(math.radians(80.0), reference_angle))
+    shear = (
+        math.sin(angle) - math.tan(reference_angle) * math.cos(angle)
+    ) * length_component * max(0.0, float(stiffness))
+    if shear < 0.0:
+        corrections[point_b] -= shear
+    else:
+        corrections[point_a] += shear
+
+
+def tank_spring_shear_corrections(
+    samples: Sequence[Mapping[str, object]],
+    *,
+    diagonal_stiffness: float = OG_TANK_SPRING_SHEAR_STIFFNESS,
+    edge_stiffness: float = OG_TANK_SPRING_SHEAR_STIFFNESS,
+) -> tuple[float, ...]:
+    """Return decompile-shaped per-point spring shear corrections.
+
+    `Spring_compute_suspension_forces` first adds two diagonal and two edge
+    shear terms into the per-point force-curve input before sampling the
+    piecewise spring curve. The exact FPU argument recovery is imperfect in the
+    decompile, but the helper shape and topology are clear: compare paired
+    edge inclination angles, scale by local point separation and SpringParam
+    stiffness, then apply the signed result to one endpoint.
+    """
+    clean = list(samples[:OG_TANK_SOFTBODY_POINT_COUNT])
+    corrections = [0.0 for _ in clean]
+    if len(clean) < OG_TANK_SOFTBODY_POINT_COUNT:
+        return tuple(corrections)
+
+    _spring_apply_shear_pair(
+        corrections,
+        clean,
+        0,
+        2,
+        1,
+        3,
+        local_axis=0,
+        stiffness=diagonal_stiffness,
+    )
+    _spring_apply_shear_pair(
+        corrections,
+        clean,
+        1,
+        3,
+        0,
+        2,
+        local_axis=0,
+        stiffness=diagonal_stiffness,
+    )
+    _spring_apply_shear_pair(
+        corrections,
+        clean,
+        0,
+        1,
+        2,
+        3,
+        local_axis=1,
+        stiffness=edge_stiffness,
+    )
+    _spring_apply_shear_pair(
+        corrections,
+        clean,
+        2,
+        3,
+        0,
+        1,
+        local_axis=1,
+        stiffness=edge_stiffness,
+    )
+    return tuple(float(v) for v in corrections)
+
+
+def piecewise_interpolate(
+    samples: Sequence[float],
+    value: float,
+    *,
+    domain_min: float = 0.0,
+    domain_max: float = 1.0,
+) -> float:
+    """Linearly sample an OG piecewise table.
+
+    `GUESS5_Piecewise_interpolate` clamps outside the configured domain and
+    linearly blends between evenly spaced samples. The tank `.pcw` files use
+    the default `0..1` domain.
+    """
+    values = tuple(float(v) for v in samples)
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    v = float(value)
+    lo = float(domain_min)
+    hi = float(domain_max)
+    if hi <= lo:
+        return values[-1]
+    if v <= lo:
+        return values[0]
+    if v >= hi:
+        return values[-1]
+    scaled = (v - lo) / (hi - lo) * float(len(values) - 1)
+    idx = int(math.floor(scaled))
+    if idx >= len(values) - 1:
+        idx = len(values) - 2
+    frac = scaled - float(idx)
+    return values[idx] + (values[idx + 1] - values[idx]) * frac
+
+
+def tank_spring_height_curve_factor(
+    clearance: float,
+    *,
+    rest_height: float = OG_TANK_SOFTBODY_REST_HEIGHT,
+    jet_abate_max: float = OG_TANK_JET_ABATE_MAX,
+) -> float:
+    """Return the decompile-backed tank jet-height curve multiplier."""
+    rest = max(0.001, float(rest_height))
+    abate = max(0.001, float(jet_abate_max))
+    height_ratio = max(0.0, float(clearance)) / rest
+    return piecewise_interpolate(OG_TANK_JET_HEIGHT_CURVE, height_ratio / abate)
+
+
+def tank_spring_piecewise_blend_factor(
+    clearance: float,
+    stretch_ratio: float,
+    *,
+    rest_height: float = OG_TANK_SOFTBODY_REST_HEIGHT,
+) -> float:
+    """Return `GUESS4_Piecewise_sample_blended`'s output blend parameter."""
+    rest = max(0.001, float(rest_height))
+    height_ratio = max(0.0, min(1.0, float(clearance) / rest))
+    stretch = max(0.0, min(1.0, float(stretch_ratio)))
+    return min(stretch, max(0.0, 1.0 - height_ratio))
+
+
 def tank_spring_force_attitude_step(
     current_roll: float,
     current_pitch: float,
@@ -641,6 +1593,12 @@ def tank_spring_force_attitude_step(
     total_lift: float,
     *,
     damping: float = 2.0,
+    point_forces: Sequence[float] | None = None,
+    point_blend_factors: Sequence[float] | None = None,
+    force_base: float = OG_TANK_FORCE_BASE_REACT,
+    force_scale: float = OG_TANK_FORCE_SLOPE_REACT,
+    torque_model: str = "decompile_config",
+    integration_model: str = "decompile_impulse",
 ) -> TankSpringForceAttitudeStep:
     """Step tank pitch/roll from per-point suspension force torque.
 
@@ -658,6 +1616,10 @@ def tank_spring_force_attitude_step(
     cur_pitch = float(current_pitch)
     vel_roll = float(roll_velocity)
     vel_pitch = float(pitch_velocity)
+    velocity_before = (vel_roll, vel_pitch)
+    integrate_model = str(integration_model or "decompile_impulse").strip().lower()
+    if integrate_model not in {"decompile_impulse", "legacy_accel"}:
+        integrate_model = "decompile_impulse"
 
     clean_samples = list(samples[:4])
     point_count = len(clean_samples)
@@ -683,18 +1645,61 @@ def tank_spring_force_attitude_step(
             torque_scale=0.0,
             damping=spring_damp,
             dt=step_dt,
+            torque_model=torque_model,
+            torque_force_scales=tuple(0.0 for _ in clean_samples),
+            integration_model=integrate_model,
+            angular_velocity_before=velocity_before,
+            spring_angular_delta=(0.0, 0.0),
+            angular_velocity_after_spring=velocity_before,
+            angular_velocity_after_damping=(vel_roll, vel_pitch),
         )
 
-    clearances = [max(0.5, _sample_float(sample, "clearance", 0.5)) for sample in clean_samples]
-    # Lower/compressed points receive a larger share of the existing vertical
-    # support. This mirrors the piecewise force curve's height blend without
-    # inventing a separate vertical target.
-    weights = [1.0 / clearance for clearance in clearances]
-    weight_sum = sum(weights)
-    if weight_sum <= 1e-9:
-        point_forces = tuple(lift / float(point_count) for _ in clean_samples)
+    supplied_point_forces: tuple[float, ...] = ()
+    if point_forces is not None:
+        try:
+            supplied_point_forces = tuple(
+                max(0.0, float(v)) for v in tuple(point_forces)[:point_count]
+            )
+        except (TypeError, ValueError):
+            supplied_point_forces = ()
+    if len(supplied_point_forces) == point_count and sum(supplied_point_forces) > 1e-9:
+        point_force_values = supplied_point_forces
     else:
-        point_forces = tuple(lift * weight / weight_sum for weight in weights)
+        clearances = [max(0.5, _sample_float(sample, "clearance", 0.5)) for sample in clean_samples]
+        # Lower/compressed points receive a larger share of the existing vertical
+        # support. This mirrors the piecewise force curve's height blend without
+        # inventing a separate vertical target.
+        weights = [1.0 / clearance for clearance in clearances]
+        weight_sum = sum(weights)
+        if weight_sum <= 1e-9:
+            point_force_values = tuple(lift / float(point_count) for _ in clean_samples)
+        else:
+            point_force_values = tuple(lift * weight / weight_sum for weight in weights)
+
+    blend_values: tuple[float, ...] = tuple(0.0 for _ in clean_samples)
+    if point_blend_factors is not None:
+        try:
+            blend_values = tuple(
+                max(0.0, min(1.0, float(v)))
+                for v in tuple(point_blend_factors)[:point_count]
+            )
+        except (TypeError, ValueError):
+            blend_values = tuple(0.0 for _ in clean_samples)
+    if len(blend_values) != point_count:
+        blend_values = tuple(0.0 for _ in clean_samples)
+
+    model = str(torque_model or "decompile_config").strip().lower()
+    if model not in {"decompile_config", "legacy_lift_normalized"}:
+        model = "decompile_config"
+    base_react = max(0.0, float(force_base))
+    slope_react = max(0.0, float(force_scale))
+    legacy_scale = 1.0 / max(lift, 1.0)
+    if model == "legacy_lift_normalized":
+        torque_scales = tuple(legacy_scale for _ in clean_samples)
+    else:
+        # Decompile: torque force is (config+0x20 + config+0x24*blend) times
+        # the same per-point force magnitude used for vertical support.
+        torque_scales = tuple(base_react + slope_react * blend for blend in blend_values)
 
     matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
     # BEHAVIOR Section 5 currently emits allocator-default local normals
@@ -704,14 +1709,19 @@ def tank_spring_force_attitude_step(
 
     local_torque_x = 0.0
     local_torque_y = 0.0
-    for sample, force_mag in zip(clean_samples, point_forces):
+    for sample, force_mag, torque_force_scale in zip(
+        clean_samples,
+        point_force_values,
+        torque_scales,
+    ):
         world_x, world_y = _sample_pair(sample, "world_offset")
         lever_x = float(world_x)
         lever_y = float(world_y)
         lever_z = _sample_float(sample, "world_offset_z", 0.0)
-        force_x = force_dir[0] * force_mag
-        force_y = force_dir[1] * force_mag
-        force_z = force_dir[2] * force_mag
+        weighted_force_mag = force_mag * torque_force_scale
+        force_x = force_dir[0] * weighted_force_mag
+        force_y = force_dir[1] * weighted_force_mag
+        force_z = force_dir[2] * weighted_force_mag
         # Decompile order: force x lever, then inverse-transform to local.
         world_torque_x = force_z * lever_y - force_y * lever_z
         world_torque_y = force_x * lever_z - lever_x * force_z
@@ -727,15 +1737,48 @@ def tank_spring_force_attitude_step(
             + matrix[4] * world_torque_y
         )
 
-    torque_scale = 1.0 / max(lift, 1.0)
-    roll_torque = local_torque_x * torque_scale - spring_damp * vel_roll
-    pitch_torque = local_torque_y * torque_scale - spring_damp * vel_pitch
-
-    if step_dt > 0.0:
-        vel_roll += roll_torque * step_dt
-        vel_pitch += pitch_torque * step_dt
-        cur_roll = (cur_roll + vel_roll * step_dt) % (2.0 * math.pi)
-        cur_pitch = (cur_pitch + vel_pitch * step_dt) % (2.0 * math.pi)
+    torque_scale = (
+        sum(torque_scales) / float(len(torque_scales))
+        if torque_scales
+        else 0.0
+    )
+    if integrate_model == "legacy_accel":
+        roll_torque = local_torque_x - spring_damp * vel_roll
+        pitch_torque = local_torque_y - spring_damp * vel_pitch
+        if step_dt > 0.0:
+            vel_roll += roll_torque * step_dt
+            vel_pitch += pitch_torque * step_dt
+            cur_roll = (cur_roll + vel_roll * step_dt) % (2.0 * math.pi)
+            cur_pitch = (cur_pitch + vel_pitch * step_dt) % (2.0 * math.pi)
+        spring_delta = (local_torque_x * step_dt, local_torque_y * step_dt)
+        velocity_after_spring = (
+            velocity_before[0] + spring_delta[0],
+            velocity_before[1] + spring_delta[1],
+        )
+        velocity_after_damping = (vel_roll, vel_pitch)
+    else:
+        # Decompile ordering: Spring_apply_forces_to_entity adds spring torque
+        # to the entity angular state before Physics_substep_integrate_angular
+        # rotates the matrix and applies angular damping for the next step.
+        roll_torque = local_torque_x
+        pitch_torque = local_torque_y
+        spring_delta = (local_torque_x, local_torque_y)
+        velocity_after_spring = (
+            vel_roll + local_torque_x,
+            vel_pitch + local_torque_y,
+        )
+        matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
+        _matrix, euler, out_velocity = matrix3_integrate_angular_shared(
+            matrix,
+            (velocity_after_spring[0], velocity_after_spring[1], 0.0),
+            step_dt,
+            angular_damping=spring_damp,
+        )
+        cur_roll = euler[0]
+        cur_pitch = euler[1]
+        vel_roll = out_velocity[0]
+        vel_pitch = out_velocity[1]
+        velocity_after_damping = (vel_roll, vel_pitch)
 
     return TankSpringForceAttitudeStep(
         roll=cur_roll,
@@ -746,11 +1789,18 @@ def tank_spring_force_attitude_step(
         local_torque_y=float(local_torque_y),
         roll_torque=float(roll_torque),
         pitch_torque=float(pitch_torque),
-        point_forces=tuple(float(v) for v in point_forces),
+        point_forces=tuple(float(v) for v in point_force_values),
         total_lift=lift,
         torque_scale=float(torque_scale),
         damping=spring_damp,
         dt=step_dt,
+        torque_model=model,
+        torque_force_scales=tuple(float(v) for v in torque_scales),
+        integration_model=integrate_model,
+        angular_velocity_before=tuple(float(v) for v in velocity_before),
+        spring_angular_delta=tuple(float(v) for v in spring_delta),
+        angular_velocity_after_spring=tuple(float(v) for v in velocity_after_spring),
+        angular_velocity_after_damping=tuple(float(v) for v in velocity_after_damping),
     )
 
 
@@ -759,6 +1809,9 @@ def tank_softbody_suspension_force(
     vertical_velocity: float,
     slot5: float,
     *,
+    samples: Sequence[Mapping[str, object]] | None = None,
+    stretch_ratios: Sequence[float] | None = None,
+    use_per_point_lift: bool = False,
     gravity: float = -50.0,
     physics_timestep_factor: float = OG_PHYSICS_TIMESTEP_FACTOR,
     max_altitude: float = 3.25,
@@ -768,6 +1821,10 @@ def tank_softbody_suspension_force(
     target_average_height: float = OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT,
     idle_slot5: float = OG_TANK_SOFTBODY_IDLE_SLOT5,
     damping: float = 6.0,
+    use_shear_corrections: bool = True,
+    shear_stiffness: float = OG_TANK_SPRING_SHEAR_STIFFNESS,
+    scalar_stretch_ratio: float = 0.0,
+    use_piecewise_height_factor: bool = False,
 ) -> TankSoftbodyForce:
     """Approximate the OG tank softbody's vertical spring-force path.
 
@@ -834,12 +1891,145 @@ def tank_softbody_suspension_force(
     lift_cap = max(support * 2.4, support + max_alt * (support / max_alt) * 2.0)
     if lift > lift_cap:
         lift = lift_cap
+    model = "softbody_empirical_flat"
+    actual_height_response = float(height_response)
+    point_force_values: tuple[float, ...] = ()
+    point_vertical_forces: tuple[float, ...] = ()
+    point_clearances: tuple[float, ...] = ()
+    point_clamped_heights: tuple[float, ...] = ()
+    point_height_errors: tuple[float, ...] = ()
+    point_normal_z: tuple[float, ...] = ()
+    point_stretch_values: tuple[float, ...] = ()
+    point_force_curve_inputs: tuple[float, ...] = ()
+    point_height_curve_factors: tuple[float, ...] = ()
+    point_blend_values: tuple[float, ...] = ()
+    point_shear_values: tuple[float, ...] = ()
+
+    clean_samples = list(samples[:OG_TANK_SOFTBODY_POINT_COUNT]) if samples is not None else []
+    if clean_samples:
+        point_count = len(clean_samples)
+        denom = max(1.0, float(point_count - 1))
+        support_share = support / float(point_count)
+        damping_share = damping_accel / float(point_count)
+        response_factor = (support / max_alt) * response_scale / denom
+        if use_shear_corrections:
+            point_shear_values = tank_spring_shear_corrections(
+                clean_samples,
+                diagonal_stiffness=shear_stiffness,
+                edge_stiffness=shear_stiffness,
+            )
+        else:
+            point_shear_values = tuple(0.0 for _ in clean_samples)
+        stretch_inputs: tuple[float, ...] = ()
+        if stretch_ratios is not None:
+            try:
+                stretch_inputs = tuple(float(v) for v in tuple(stretch_ratios)[:point_count])
+            except (TypeError, ValueError):
+                stretch_inputs = ()
+
+        forces: list[float] = []
+        vertical_forces: list[float] = []
+        clearances: list[float] = []
+        clamped_heights: list[float] = []
+        height_errors: list[float] = []
+        normal_z_values: list[float] = []
+        stretch_values: list[float] = []
+        curve_inputs: list[float] = []
+        height_curve_factors: list[float] = []
+        blend_values: list[float] = []
+        global_stretch_blend = max(0.0, min(1.0, float(scalar_stretch_ratio)))
+        for idx, sample in enumerate(clean_samples):
+            clearance = _sample_float(sample, "clearance", avg * denom / float(point_count))
+            terrain_height = max(0.5, clearance)
+            height_curve_factor = tank_spring_height_curve_factor(
+                terrain_height,
+                rest_height=rest,
+            )
+            try:
+                sample_stretch = float(sample.get("stretch_ratio", 1.0))
+            except (TypeError, ValueError):
+                sample_stretch = 1.0
+            if idx < len(stretch_inputs):
+                sample_stretch = stretch_inputs[idx]
+            if sample_stretch <= 0.0:
+                sample_stretch = 1.0
+            # The exact piecewise samples are still data-backed by OG traces, but
+            # the force path shape is decompiled: each point gets its own
+            # terrain-height input, force-curve input, optional stretch, and
+            # loaded spring-point normal. The terrain surface normal is only
+            # accumulated by Spring_update_world_state; the force kernel uses
+            # the Section-5 point normal, whose allocator/default value is
+            # (0, 0, -1), then negates force magnitude.
+            shear_correction = (
+                point_shear_values[idx]
+                if idx < len(point_shear_values)
+                else 0.0
+            )
+            point_force_curve_input = max(0.0, force_curve_input + shear_correction)
+            point_input_ratio = point_force_curve_input / idle_force_curve_input
+            point_target_average = base_target * point_input_ratio
+            if point_target_average < target_floor:
+                point_target_average = target_floor
+            elif point_target_average > target_ceiling:
+                point_target_average = target_ceiling
+            point_target = point_target_average * denom / float(point_count)
+            point_error = point_target - terrain_height
+            point_force = (support_share + point_error * response_factor + damping_share) * sample_stretch
+            if use_piecewise_height_factor:
+                point_force *= height_curve_factor
+            if point_force < 0.0:
+                point_force = 0.0
+            normal = _sample_vec3(sample, "spring_normal", OG_TANK_SPRING_POINT_NORMAL)
+            # Decompile: linear_force_z = (-force_magnitude) * normal_z. The
+            # useful upward projection is therefore -normal_z, not terrain
+            # surface normal Z.
+            normal_z = max(0.0, min(1.0, -float(normal[2])))
+            vertical_force = point_force * normal_z
+            scalar_stretch = _sample_float(sample, "stretch_blend", global_stretch_blend)
+            blend_factor = tank_spring_piecewise_blend_factor(
+                terrain_height,
+                scalar_stretch,
+                rest_height=rest,
+            )
+
+            clearances.append(float(clearance))
+            clamped_heights.append(float(terrain_height))
+            height_errors.append(float(point_error))
+            forces.append(float(point_force))
+            vertical_forces.append(float(vertical_force))
+            normal_z_values.append(float(normal_z))
+            stretch_values.append(float(sample_stretch))
+            curve_inputs.append(float(point_force_curve_input))
+            height_curve_factors.append(float(height_curve_factor))
+            blend_values.append(float(blend_factor))
+
+        point_lift = sum(vertical_forces)
+        if point_lift > lift_cap and point_lift > 1e-9:
+            scale = lift_cap / point_lift
+            forces = [v * scale for v in forces]
+            vertical_forces = [v * scale for v in vertical_forces]
+            point_lift = lift_cap
+        point_force_values = tuple(forces)
+        point_vertical_forces = tuple(vertical_forces)
+        point_clearances = tuple(clearances)
+        point_clamped_heights = tuple(clamped_heights)
+        point_height_errors = tuple(height_errors)
+        point_normal_z = tuple(normal_z_values)
+        point_stretch_values = tuple(stretch_values)
+        point_force_curve_inputs = tuple(curve_inputs)
+        point_height_curve_factors = tuple(height_curve_factors)
+        point_blend_values = tuple(blend_values)
+        model = "softbody_per_point_piecewise_probe"
+        if use_per_point_lift:
+            lift = max(0.0, float(point_lift))
+            actual_height_response = float(lift - support - damping_accel)
+            model = "softbody_per_point_piecewise_proxy"
 
     return TankSoftbodyForce(
-        model="softbody_empirical_flat",
+        model=model,
         lift_accel=float(lift),
         support_accel=float(support),
-        height_response_accel=float(height_response),
+        height_response_accel=float(actual_height_response),
         damping_accel=float(damping_accel),
         average_height=avg,
         target_average_height=target,
@@ -855,6 +2045,18 @@ def tank_softbody_suspension_force(
         rest_height=float(rest),
         max_altitude=float(max_alt),
         force_offset=float(force_offset),
+        point_count=len(point_force_values),
+        point_forces=point_force_values,
+        point_vertical_forces=point_vertical_forces,
+        point_clearances=point_clearances,
+        point_clamped_heights=point_clamped_heights,
+        point_height_errors=point_height_errors,
+        point_normal_z=point_normal_z,
+        point_stretch_ratios=point_stretch_values,
+        point_force_curve_inputs=point_force_curve_inputs,
+        point_height_curve_factors=point_height_curve_factors,
+        point_blend_factors=point_blend_values,
+        point_shear_corrections=point_shear_values,
     )
 
 
