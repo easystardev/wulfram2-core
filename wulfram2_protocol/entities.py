@@ -1835,6 +1835,61 @@ def _extract_euler_angles_shared(matrix: Sequence[float]) -> tuple[float, float,
     )
 
 
+def _angle_delta_shared(target: float, source: float) -> float:
+    delta = _f32_shared(float(target) - float(source))
+    while delta <= -math.pi:
+        delta = _f32_shared(delta + _F32_TWO_PI)
+    while delta > math.pi:
+        delta = _f32_shared(delta - _F32_TWO_PI)
+    return delta
+
+
+def tank_body_matrix_with_heading(
+    rotation_matrix: Sequence[float] | None,
+    heading: float,
+    *,
+    fallback_roll: float = 0.0,
+    fallback_pitch: float = 0.0,
+) -> tuple[float, ...]:
+    """Return a spring/body matrix whose yaw matches the authoritative heading.
+
+    The tank keeps yaw in the normal entity heading path while spring forces
+    maintain the body pitch/roll matrix. Control-plane resets and yaw physics
+    can therefore leave a valid spring matrix with stale yaw. `Spring_update_world_state`
+    and `TankVehicle_apply_physics` both consume the full entity matrix, so
+    rotate the matrix basis around world Z to the current heading before using it.
+    """
+    try:
+        matrix = tuple(_f32_shared(float(v)) for v in tuple(rotation_matrix or ())[:9])
+    except (TypeError, ValueError):
+        matrix = ()
+    if len(matrix) != 9:
+        return _matrix3_from_euler_xyz_shared(
+            float(fallback_roll),
+            float(fallback_pitch),
+            float(heading),
+        )
+
+    _roll, _pitch, current_yaw = _extract_euler_angles_shared(matrix)
+    delta = _angle_delta_shared(float(heading), current_yaw)
+    if abs(delta) <= 1e-6:
+        return tuple(float(v) for v in matrix)
+
+    cos_d = _f32_shared(math.cos(delta))
+    sin_d = _f32_shared(math.sin(delta))
+    return (
+        _f32_shared(_f32_shared(cos_d * matrix[0]) - _f32_shared(sin_d * matrix[3])),
+        _f32_shared(_f32_shared(cos_d * matrix[1]) - _f32_shared(sin_d * matrix[4])),
+        _f32_shared(_f32_shared(cos_d * matrix[2]) - _f32_shared(sin_d * matrix[5])),
+        _f32_shared(_f32_shared(sin_d * matrix[0]) + _f32_shared(cos_d * matrix[3])),
+        _f32_shared(_f32_shared(sin_d * matrix[1]) + _f32_shared(cos_d * matrix[4])),
+        _f32_shared(_f32_shared(sin_d * matrix[2]) + _f32_shared(cos_d * matrix[5])),
+        float(matrix[6]),
+        float(matrix[7]),
+        float(matrix[8]),
+    )
+
+
 def matrix3_integrate_angular_shared(
     matrix: Sequence[float],
     angular_velocity: Sequence[float],
@@ -1926,10 +1981,11 @@ def tank_body_matrix_drive_basis(
     body pitch/roll, using the body matrix is the decompile-backed path; the
     older flat-yaw basis remains useful only as an explicit debug fallback.
     """
-    matrix = (
-        tuple(float(v) for v in rotation_matrix[:9])
-        if rotation_matrix is not None and len(rotation_matrix) >= 9
-        else _matrix3_from_euler_xyz_shared(float(roll), float(pitch), float(heading))
+    matrix = tank_body_matrix_with_heading(
+        rotation_matrix,
+        heading,
+        fallback_roll=float(roll),
+        fallback_pitch=float(pitch),
     )
     # Local +X is forward, local +Y is right in the same row-major matrix shape
     # used by Spring_update_world_state.
@@ -2378,6 +2434,13 @@ def tank_spring_force_attitude_step(
         source_matrix = ()
     if len(source_matrix) != 9:
         source_matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
+    else:
+        source_matrix = tank_body_matrix_with_heading(
+            source_matrix,
+            heading,
+            fallback_roll=cur_roll,
+            fallback_pitch=cur_pitch,
+        )
 
     clean_samples = list(samples[:4])
     point_count = len(clean_samples)
@@ -3124,6 +3187,8 @@ def tank_suspension_world_sample_offsets(
             sin_h, cos_h, 0.0,
             0.0, 0.0, 1.0,
         )
+    else:
+        rotation_matrix = tank_body_matrix_with_heading(rotation_matrix, heading)
     return tuple(
         (
             local_z * float(rotation_matrix[2])
