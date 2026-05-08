@@ -4,7 +4,7 @@ Entity type definitions, shared vehicle helpers, and behavior slot indices.
 
 from enum import IntEnum
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import Callable, Mapping, Optional, Sequence, Tuple
 import math
 import struct
 
@@ -815,6 +815,16 @@ class StaticTerrainConstraintResult:
 
 
 @dataclass(frozen=True)
+class IterativeTerrainSeparationResult:
+    """Result from the OG collision-at-start iterative separation branch."""
+
+    position: Tuple[float, float, float]
+    cleared: bool
+    iterations: int
+    debug: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class EntityInterpolationDecision:
     """Decision shape for OG Entity_interpolate_toward_target."""
 
@@ -853,6 +863,120 @@ def _vec3_normalize(v: Sequence[float]) -> Tuple[float, float, float] | None:
         return None
     inv = 1.0 / length
     return (float(v[0]) * inv, float(v[1]) * inv, float(v[2]) * inv)
+
+
+def resolve_iterative_terrain_start_contact(
+    *,
+    position: Sequence[float],
+    contact_normal: Sequence[float],
+    sample_contact: Callable[[Tuple[float, float, float]], object | None],
+    slop: float = 0.005,
+    max_iterations: int = 40,
+    use_vertical_fallback: bool = True,
+) -> IterativeTerrainSeparationResult:
+    """Approximate `Collision_resolve_pair_iterative` for entity-vs-world starts.
+
+    OG routes sweep records whose `+0x119` flag is set away from the normal
+    constraint solver and into an iterative position-separation loop. For
+    entity-vs-world pairs that loop restores the saved pose each attempt,
+    pushes the entity along the contact normal blended toward a vertical
+    fallback, escalates magnitude by 1.2x, and retests until the pair clears.
+    """
+
+    base = (float(position[0]), float(position[1]), float(position[2]))
+    normal = _vec3_normalize(contact_normal) or (0.0, 0.0, 1.0)
+    fallback = (0.0, 0.0, 1.0) if use_vertical_fallback else (0.0, 0.0, 1.0)
+    blend = 1.0
+    magnitude = 1.0
+    iteration_limit = max(1, min(200, int(max_iterations)))
+    slop_value = max(0.0, float(slop))
+    attempts: list[dict[str, object]] = []
+    best_position = base
+    best_penetration: float | None = None
+
+    for iteration in range(1, iteration_limit + 1):
+        if magnitude > 1000.0:
+            magnitude = 200.0
+        if blend < 0.0:
+            blend = 0.0
+        random_weight = 1.0 - blend
+        direction = _vec3_normalize((
+            normal[0] * blend + fallback[0] * random_weight,
+            normal[1] * blend + fallback[1] * random_weight,
+            normal[2] * blend + fallback[2] * random_weight,
+        )) or fallback
+        candidate = (
+            base[0] + direction[0] * magnitude,
+            base[1] + direction[1] * magnitude,
+            base[2] + direction[2] * magnitude,
+        )
+        contact = sample_contact(candidate)
+        penetration = 0.0
+        if contact is not None:
+            try:
+                penetration = float(getattr(contact, "penetration", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                penetration = 0.0
+        colliding = contact is not None and penetration > slop_value
+        if best_penetration is None or penetration < best_penetration:
+            best_penetration = penetration
+            best_position = candidate
+        if len(attempts) < 8:
+            attempts.append({
+                "iteration": iteration,
+                "blend": blend,
+                "magnitude": magnitude,
+                "direction": direction,
+                "position": candidate,
+                "penetration": penetration,
+                "colliding": colliding,
+            })
+        if not colliding:
+            delta = (
+                candidate[0] - base[0],
+                candidate[1] - base[1],
+                candidate[2] - base[2],
+            )
+            return IterativeTerrainSeparationResult(
+                position=candidate,
+                cleared=True,
+                iterations=iteration,
+                debug={
+                    "response": "terrain_contact_iterative_position_rollback",
+                    "iterative_separation_model": "Collision_resolve_pair_iterative_world_vertical",
+                    "iterative_cleared": True,
+                    "iterative_iterations": iteration,
+                    "iterative_position_delta": delta,
+                    "iterative_position_delta_mag": _vec3_len(delta),
+                    "iterative_final_penetration": penetration,
+                    "iterative_attempts": attempts,
+                    "velocity_unchanged_by_iterative_separation": True,
+                },
+            )
+        magnitude *= 1.2
+        blend -= 0.05
+
+    delta = (
+        best_position[0] - base[0],
+        best_position[1] - base[1],
+        best_position[2] - base[2],
+    )
+    return IterativeTerrainSeparationResult(
+        position=best_position,
+        cleared=False,
+        iterations=iteration_limit,
+        debug={
+            "response": "terrain_contact_iterative_position_rollback",
+            "iterative_separation_model": "Collision_resolve_pair_iterative_world_vertical",
+            "iterative_cleared": False,
+            "iterative_iterations": iteration_limit,
+            "iterative_position_delta": delta,
+            "iterative_position_delta_mag": _vec3_len(delta),
+            "iterative_final_penetration": best_penetration,
+            "iterative_attempts": attempts,
+            "velocity_unchanged_by_iterative_separation": True,
+        },
+    )
 
 
 def _matrix3_transform_vector_shared(
