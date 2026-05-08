@@ -802,6 +802,7 @@ class TankSpringForceAttitudeStep:
     spring_angular_delta: tuple[float, float] = (0.0, 0.0)
     angular_velocity_after_spring: tuple[float, float] = (0.0, 0.0)
     angular_velocity_after_damping: tuple[float, float] = (0.0, 0.0)
+    rotation_matrix: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2344,6 +2345,7 @@ def tank_spring_force_attitude_step(
     force_scale: float = OG_TANK_FORCE_SLOPE_REACT,
     torque_model: str = "decompile_config",
     integration_model: str = "decompile_accel",
+    rotation_matrix: Sequence[float] | None = None,
 ) -> TankSpringForceAttitudeStep:
     """Step tank pitch/roll from per-point suspension force torque.
 
@@ -2366,6 +2368,16 @@ def tank_spring_force_attitude_step(
     integrate_model = str(integration_model or "decompile_accel").strip().lower()
     if integrate_model not in {"decompile_accel", "decompile_impulse", "legacy_accel"}:
         integrate_model = "decompile_accel"
+    try:
+        source_matrix = (
+            tuple(float(v) for v in tuple(rotation_matrix or ())[:9])
+            if rotation_matrix is not None
+            else ()
+        )
+    except (TypeError, ValueError):
+        source_matrix = ()
+    if len(source_matrix) != 9:
+        source_matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
 
     clean_samples = list(samples[:4])
     point_count = len(clean_samples)
@@ -2377,6 +2389,7 @@ def tank_spring_force_attitude_step(
             vel_pitch += pitch_torque * step_dt
             cur_roll = (cur_roll + vel_roll * step_dt) % (2.0 * math.pi)
             cur_pitch = (cur_pitch + vel_pitch * step_dt) % (2.0 * math.pi)
+        out_matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
         return TankSpringForceAttitudeStep(
             roll=cur_roll,
             pitch=cur_pitch,
@@ -2398,6 +2411,7 @@ def tank_spring_force_attitude_step(
             spring_angular_delta=(0.0, 0.0),
             angular_velocity_after_spring=velocity_before,
             angular_velocity_after_damping=(vel_roll, vel_pitch),
+            rotation_matrix=tuple(float(v) for v in out_matrix),
         )
 
     supplied_point_forces: tuple[float, ...] = ()
@@ -2447,10 +2461,10 @@ def tank_spring_force_attitude_step(
         # the same per-point force magnitude used for vertical support.
         torque_scales = tuple(base_react + slope_react * blend for blend in blend_values)
 
-    matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
     # BEHAVIOR Section 5 currently emits allocator-default local normals
     # `(0, 0, -1)`. The force kernel negates the magnitude, so the effective
     # world force is along the body up column.
+    matrix = source_matrix
     force_dir = (matrix[2], matrix[5], matrix[8])
 
     local_torque_x = 0.0
@@ -2496,6 +2510,7 @@ def tank_spring_force_attitude_step(
             vel_pitch += pitch_torque * step_dt
             cur_roll = (cur_roll + vel_roll * step_dt) % (2.0 * math.pi)
             cur_pitch = (cur_pitch + vel_pitch * step_dt) % (2.0 * math.pi)
+        out_matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
         spring_delta = (local_torque_x * step_dt, local_torque_y * step_dt)
         velocity_after_spring = (
             velocity_before[0] + spring_delta[0],
@@ -2514,9 +2529,8 @@ def tank_spring_force_attitude_step(
             vel_roll + local_torque_x,
             vel_pitch + local_torque_y,
         )
-        matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
-        _matrix, euler, out_velocity = matrix3_integrate_angular_shared(
-            matrix,
+        out_matrix, euler, out_velocity = matrix3_integrate_angular_shared(
+            source_matrix,
             (velocity_after_spring[0], velocity_after_spring[1], 0.0),
             step_dt,
             angular_damping=spring_damp,
@@ -2538,9 +2552,8 @@ def tank_spring_force_attitude_step(
             vel_roll + spring_delta[0],
             vel_pitch + spring_delta[1],
         )
-        matrix = _matrix3_from_euler_xyz_shared(cur_roll, cur_pitch, float(heading))
-        _matrix, euler, out_velocity = matrix3_integrate_angular_shared(
-            matrix,
+        out_matrix, euler, out_velocity = matrix3_integrate_angular_shared(
+            source_matrix,
             (vel_roll, vel_pitch, 0.0),
             step_dt,
             angular_acceleration=(local_torque_x, local_torque_y, 0.0),
@@ -2573,6 +2586,7 @@ def tank_spring_force_attitude_step(
         spring_angular_delta=tuple(float(v) for v in spring_delta),
         angular_velocity_after_spring=tuple(float(v) for v in velocity_after_spring),
         angular_velocity_after_damping=tuple(float(v) for v in velocity_after_damping),
+        rotation_matrix=tuple(float(v) for v in out_matrix),
     )
 
 
