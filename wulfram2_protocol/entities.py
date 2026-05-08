@@ -1304,8 +1304,20 @@ def solve_static_terrain_constraint(
         return torque
 
     pv_before = point_velocity()
+    world_point_velocity = (0.0, 0.0, 0.0)
+    relative_velocity_body_minus_world = (
+        pv_before[0] - world_point_velocity[0],
+        pv_before[1] - world_point_velocity[1],
+        pv_before[2] - world_point_velocity[2],
+    )
+    relative_velocity_world_minus_body = (
+        world_point_velocity[0] - pv_before[0],
+        world_point_velocity[1] - pv_before[1],
+        world_point_velocity[2] - pv_before[2],
+    )
     center_normal_before = _vec3_dot(vel, normal)
-    point_normal_before = _vec3_dot(pv_before, normal)
+    point_normal_before = _vec3_dot(relative_velocity_body_minus_world, normal)
+    opposite_point_normal_before = _vec3_dot(relative_velocity_world_minus_body, normal)
     eff_normal_initial, inertia_normal_initial, torque_normal = effective_mass(normal)
     accumulated_normal_impulse = 0.0
     total_friction_impulse = 0.0
@@ -1438,6 +1450,20 @@ def solve_static_terrain_constraint(
     debug = {
         "response": "terrain_contact_constraint_solver",
         "constraint_model": "decompile_static_terrain_sequential_impulse",
+        "constraint_pair_order": "static_world_body",
+        "constraint_record_order": "body_static_world",
+        "constraint_record_order_source": "inferred_entity_vs_world_body_positive_impulse",
+        "constraint_projection_model": "Constraint_compute_velocity_projection_body_minus_world",
+        "constraint_world_point_velocity_before": world_point_velocity,
+        "constraint_body_point_velocity_before": pv_before,
+        "constraint_relative_velocity_before": relative_velocity_body_minus_world,
+        "constraint_opposite_relative_velocity_before": relative_velocity_world_minus_body,
+        "constraint_normal_used_for_projection": normal,
+        "constraint_separation_speed_before": point_normal_before,
+        "constraint_opposite_separation_speed_before": opposite_point_normal_before,
+        "normal_impulse_body_sign": 1.0,
+        "normal_impulse_world_sign": -1.0,
+        "normal_impulse_body_direction": normal,
         "position_correction": position_correction,
         "position_correction_cap": correction_limit,
         "normal_velocity_before": center_normal_before,
