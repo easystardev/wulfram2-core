@@ -2337,11 +2337,16 @@ def tank_spring_piecewise_force_sample(
         jet_abate_max=jet_abate_max,
     )
     speed_curve_factor = piecewise_interpolate(OG_TANK_JET_SPEED_CURVE, stretch)
+    # The file names are misleading here. The recovered
+    # `GUESS4_Piecewise_sample_blended` call order samples the `abate` table
+    # with the height ratio, then uses the `height_consider` table as the
+    # stretch-side denominator term. Live OG force rows match that call order;
+    # the name-based mapping over-predicts active rough-terrain spring impulse.
     height_consider_factor = piecewise_interpolate(
-        OG_TANK_JET_HEIGHT_CONSIDER_CURVE,
+        OG_TANK_JET_ABATE_CURVE,
         height_ratio,
     )
-    abate_factor = piecewise_interpolate(OG_TANK_JET_ABATE_CURVE, stretch)
+    abate_factor = piecewise_interpolate(OG_TANK_JET_HEIGHT_CONSIDER_CURVE, stretch)
     react_blend = (
         (speed_curve_factor + height_consider_factor * abate_factor)
         / max(0.001, abate_factor + 1.0)
