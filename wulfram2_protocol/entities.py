@@ -1152,6 +1152,7 @@ def solve_static_terrain_constraint(
     correction_cap: float = 0.005,
     target_separation: float = 0.005,
     constraint_iterations: int = 100,
+    solver_variant: str = "constraint",
     restitution_fraction: float = 0.1,
     enable_inactive_retest: bool = False,
     inactive_retest_bias: float = 0.1,
@@ -1345,7 +1346,25 @@ def solve_static_terrain_constraint(
     max_post_normal_tangent_speed = 0.0
     normal_iterations = 0
     friction_iterations = 0
-    iteration_limit = max(1, min(100, int(constraint_iterations)))
+    solver_variant_key = str(solver_variant or "constraint").strip().lower()
+    if solver_variant_key in {
+        "contact",
+        "contact_iterative",
+        "direct_contact",
+        "type0d_contact",
+        "type_0d_contact",
+    }:
+        solver_variant_key = "contact_iterative"
+        iteration_limit = max(1, min(40, int(constraint_iterations)))
+        solver_min_correction_initial = 0.1
+        solver_min_correction_increment = 0.002
+        solver_progressive_scaling = False
+    else:
+        solver_variant_key = "constraint_iterative"
+        iteration_limit = max(1, min(100, int(constraint_iterations)))
+        solver_min_correction_initial = 0.005
+        solver_min_correction_increment = 0.0001
+        solver_progressive_scaling = True
     primary_normal_iterations = 0
     retest_iterations = 0
     primary_start_separation_speed = point_normal_before
@@ -1377,7 +1396,7 @@ def solve_static_terrain_constraint(
         nonlocal friction_iterations
         nonlocal projection_speed_source
 
-        min_correction_threshold = 0.005
+        min_correction_threshold = solver_min_correction_initial
         projection_pv, start_speed, pass_projection_source = projected_velocity(pass_target_separation)
         start_projection_source = pass_projection_source
         projection_speed_source = pass_projection_source
@@ -1390,7 +1409,7 @@ def solve_static_terrain_constraint(
             if separation_speed >= float(pass_target_separation):
                 break
             correction = float(pass_target_separation) - separation_speed
-            if min_correction_threshold < correction:
+            if solver_progressive_scaling and min_correction_threshold < correction:
                 correction = (correction * float(iteration)) / 500.0
             if correction < min_correction_threshold:
                 correction = min_correction_threshold
@@ -1447,7 +1466,7 @@ def solve_static_terrain_constraint(
                     friction_iterations += 1
                     _post_friction_pv, final_speed, projection_speed_source = projected_velocity(pass_target_separation)
 
-            min_correction_threshold += 0.0001
+            min_correction_threshold += solver_min_correction_increment
         return start_speed, final_speed, pass_iterations, start_projection_source
 
     (
@@ -1492,6 +1511,11 @@ def solve_static_terrain_constraint(
     debug = {
         "response": "terrain_contact_constraint_solver",
         "constraint_model": "decompile_static_terrain_sequential_impulse",
+        "constraint_solver_variant": solver_variant_key,
+        "constraint_iteration_limit": iteration_limit,
+        "constraint_min_correction_initial": solver_min_correction_initial,
+        "constraint_min_correction_increment": solver_min_correction_increment,
+        "constraint_progressive_scaling": solver_progressive_scaling,
         "constraint_pair_order": "static_world_body",
         "constraint_record_order": "body_static_world",
         "constraint_record_order_source": "inferred_entity_vs_world_body_positive_impulse",
