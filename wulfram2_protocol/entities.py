@@ -1155,6 +1155,7 @@ def solve_static_terrain_constraint(
     restitution_fraction: float = 0.1,
     enable_inactive_retest: bool = False,
     inactive_retest_bias: float = 0.1,
+    projection_order: str = "body_minus_world",
     body_rotation: Sequence[float] | None = None,
     rotation_matrix: Sequence[float] | None = None,
 ) -> StaticTerrainConstraintResult:
@@ -1319,6 +1320,25 @@ def solve_static_terrain_constraint(
     point_normal_before = _vec3_dot(relative_velocity_body_minus_world, normal)
     opposite_point_normal_before = _vec3_dot(relative_velocity_world_minus_body, normal)
     eff_normal_initial, inertia_normal_initial, torque_normal = effective_mass(normal)
+    projection_order_key = str(projection_order or "body_minus_world").strip().lower()
+    if projection_order_key in {
+        "opposite-if-separating",
+        "opposite_if_separating",
+        "opposite_if_body_separating",
+        "world_if_body_separating",
+    }:
+        projection_order_key = "opposite_if_separating"
+    elif projection_order_key in {
+        "world-body",
+        "world_body",
+        "world_minus_body",
+        "static_minus_body",
+        "opposite",
+    }:
+        projection_order_key = "world_minus_body"
+    else:
+        projection_order_key = "body_minus_world"
+    projection_speed_source = "body_minus_world"
     accumulated_normal_impulse = 0.0
     total_friction_impulse = 0.0
     max_friction_impulse = 0.0
@@ -1335,21 +1355,37 @@ def solve_static_terrain_constraint(
     retest_target_separation = None
     retest_final_separation_speed = None
 
-    def run_constraint_pass(pass_target_separation: float) -> Tuple[float, float, int]:
+    def projected_velocity(pass_target_separation: float) -> Tuple[Tuple[float, float, float], float, str]:
+        pv = point_velocity()
+        body_projection = _vec3_dot(pv, normal)
+        if projection_order_key == "world_minus_body":
+            return (-pv[0], -pv[1], -pv[2]), -body_projection, "world_minus_body"
+        if (
+            projection_order_key == "opposite_if_separating"
+            and body_projection >= float(pass_target_separation)
+            and -body_projection < float(pass_target_separation)
+        ):
+            return (-pv[0], -pv[1], -pv[2]), -body_projection, "world_minus_body_if_body_separating"
+        return pv, body_projection, "body_minus_world"
+
+    def run_constraint_pass(pass_target_separation: float) -> Tuple[float, float, int, str]:
         nonlocal accumulated_normal_impulse
         nonlocal total_friction_impulse
         nonlocal max_friction_impulse
         nonlocal max_post_normal_tangent_speed
         nonlocal normal_iterations
         nonlocal friction_iterations
+        nonlocal projection_speed_source
 
         min_correction_threshold = 0.005
-        start_speed = _vec3_dot(point_velocity(), normal)
+        projection_pv, start_speed, pass_projection_source = projected_velocity(pass_target_separation)
+        start_projection_source = pass_projection_source
+        projection_speed_source = pass_projection_source
         final_speed = start_speed
         pass_iterations = 0
         for iteration in range(1, iteration_limit + 1):
-            pv = point_velocity()
-            separation_speed = _vec3_dot(pv, normal)
+            projection_pv, separation_speed, pass_projection_source = projected_velocity(pass_target_separation)
+            projection_speed_source = pass_projection_source
             final_speed = separation_speed
             if separation_speed >= float(pass_target_separation):
                 break
@@ -1369,11 +1405,12 @@ def solve_static_terrain_constraint(
             pass_iterations += 1
 
             post_normal_pv = point_velocity()
-            final_speed = _vec3_dot(post_normal_pv, normal)
+            _post_projection_pv, final_speed, projection_speed_source = projected_velocity(pass_target_separation)
+            post_normal_component = _vec3_dot(post_normal_pv, normal)
             post_normal_tangent = (
-                post_normal_pv[0] - normal[0] * final_speed,
-                post_normal_pv[1] - normal[1] * final_speed,
-                post_normal_pv[2] - normal[2] * final_speed,
+                post_normal_pv[0] - normal[0] * post_normal_component,
+                post_normal_pv[1] - normal[1] * post_normal_component,
+                post_normal_pv[2] - normal[2] * post_normal_component,
             )
             max_post_normal_tangent_speed = max(
                 max_post_normal_tangent_speed,
@@ -1383,8 +1420,10 @@ def solve_static_terrain_constraint(
             # OG passes the relative-velocity projection buffer captured before
             # the normal impulse into Constraint_apply_friction, then recomputes
             # the projection after friction for the loop condition.
-            friction_pv = pv
-            normal_component = separation_speed
+            # `opposite_if_separating` only changes the normal activation
+            # projection; tangent friction still opposes the body's point motion.
+            friction_pv = point_velocity() if pass_projection_source != "body_minus_world" else projection_pv
+            normal_component = _vec3_dot(friction_pv, normal)
             tangent = (
                 friction_pv[0] - normal[0] * normal_component,
                 friction_pv[1] - normal[1] * normal_component,
@@ -1406,15 +1445,16 @@ def solve_static_terrain_constraint(
                     total_friction_impulse += friction_impulse
                     max_friction_impulse = max(max_friction_impulse, abs(friction_impulse))
                     friction_iterations += 1
-                    final_speed = _vec3_dot(point_velocity(), normal)
+                    _post_friction_pv, final_speed, projection_speed_source = projected_velocity(pass_target_separation)
 
             min_correction_threshold += 0.0001
-        return start_speed, final_speed, pass_iterations
+        return start_speed, final_speed, pass_iterations, start_projection_source
 
     (
         primary_start_separation_speed,
         primary_final_separation_speed,
         primary_normal_iterations,
+        primary_projection_speed_source,
     ) = run_constraint_pass(float(target_separation))
 
     if (
@@ -1430,7 +1470,9 @@ def solve_static_terrain_constraint(
             _retest_start,
             retest_final_separation_speed,
             retest_iterations,
+            retest_projection_speed_source,
         ) = run_constraint_pass(retest_target_separation)
+        projection_speed_source = retest_projection_speed_source
         retest_applied = retest_iterations > 0
 
     restitution_impulse = 0.0
@@ -1454,11 +1496,17 @@ def solve_static_terrain_constraint(
         "constraint_record_order": "body_static_world",
         "constraint_record_order_source": "inferred_entity_vs_world_body_positive_impulse",
         "constraint_projection_model": "Constraint_compute_velocity_projection_body_minus_world",
+        "constraint_projection_order": projection_order_key,
+        "constraint_projection_speed_source": projection_speed_source,
+        "constraint_primary_projection_speed_source": primary_projection_speed_source,
         "constraint_world_point_velocity_before": world_point_velocity,
         "constraint_body_point_velocity_before": pv_before,
         "constraint_relative_velocity_before": relative_velocity_body_minus_world,
         "constraint_opposite_relative_velocity_before": relative_velocity_world_minus_body,
         "constraint_normal_used_for_projection": normal,
+        "constraint_body_minus_world_speed_before": point_normal_before,
+        "constraint_world_minus_body_speed_before": opposite_point_normal_before,
+        "constraint_selected_separation_speed_before": primary_start_separation_speed,
         "constraint_separation_speed_before": point_normal_before,
         "constraint_opposite_separation_speed_before": opposite_point_normal_before,
         "normal_impulse_body_sign": 1.0,
