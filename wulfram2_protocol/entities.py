@@ -238,7 +238,7 @@ class VehiclePhysicsConfig:
 
 @dataclass(frozen=True)
 class JumpJetConfig:
-    """Opt-in custom jump-jet tuning shared by server and Python prediction."""
+    """Custom jump-jet tuning shared by server and Python prediction."""
 
     impulse: float = 15.0
     cooldown: float = 3.0
@@ -246,16 +246,16 @@ class JumpJetConfig:
     max_altitude: float = 50.0
 
 
-# Custom extension, not part of the original Tank controller. The runtime gates
-# use behind WULFRAM_JUMP_JETS so default clone physics remains OG-focused.
+# Custom extension driven by OG slot 4. Runtime still honors
+# WULFRAM_JUMP_JETS=0 as an escape hatch.
 #
 # The first 15u/s tank impulse technically fired but only peaked around 1.6u
 # above the ground under the clone's normal gravity/damping, which is easy to
-# miss in OG and Python cameras. The opt-in extension uses a larger impulse so
-# a successful jump is observable without changing default clone physics.
+# miss in OG and Python cameras. The promoted extension uses a larger impulse so
+# a successful jump is clearly observable in the default playable clone.
 JUMP_JET_SPAWN_LOCKOUT = 2.0
 JUMP_JET_CONFIGS = {
-    EntityType.TANK: JumpJetConfig(impulse=45.0, cooldown=3.0, fuel_cost=10.0, max_altitude=50.0),
+    EntityType.TANK: JumpJetConfig(impulse=112.5, cooldown=3.0, fuel_cost=10.0, max_altitude=50.0),
     EntityType.SCOUT: JumpJetConfig(impulse=55.0, cooldown=2.0, fuel_cost=8.0, max_altitude=55.0),
     EntityType.ASSAULT_PLATFORM: JumpJetConfig(impulse=35.0, cooldown=5.0, fuel_cost=15.0, max_altitude=45.0),
 }
@@ -1322,6 +1322,7 @@ def solve_static_terrain_constraint(
     opposite_point_normal_before = _vec3_dot(relative_velocity_world_minus_body, normal)
     eff_normal_initial, inertia_normal_initial, torque_normal = effective_mass(normal)
     projection_order_key = str(projection_order or "body_minus_world").strip().lower()
+    projection_impulse_sign_mode = "body_positive"
     if projection_order_key in {
         "opposite-if-separating",
         "opposite_if_separating",
@@ -1337,6 +1338,24 @@ def solve_static_terrain_constraint(
         "opposite",
     }:
         projection_order_key = "world_minus_body"
+    elif projection_order_key in {
+        "opposite-if-separating-signed",
+        "opposite_if_separating_signed",
+        "signed_opposite_if_separating",
+        "opposite_if_body_separating_signed",
+        "world_if_body_separating_signed",
+    }:
+        projection_order_key = "opposite_if_separating"
+        projection_impulse_sign_mode = "match_projection"
+    elif projection_order_key in {
+        "world-body-signed",
+        "world_body_signed",
+        "world_minus_body_signed",
+        "static_minus_body_signed",
+        "opposite_signed",
+    }:
+        projection_order_key = "world_minus_body"
+        projection_impulse_sign_mode = "match_projection"
     else:
         projection_order_key = "body_minus_world"
     projection_speed_source = "body_minus_world"
@@ -1373,6 +1392,7 @@ def solve_static_terrain_constraint(
     retest_start_separation_speed = None
     retest_target_separation = None
     retest_final_separation_speed = None
+    last_normal_impulse_direction = normal
 
     def projected_velocity(pass_target_separation: float) -> Tuple[Tuple[float, float, float], float, str]:
         pv = point_velocity()
@@ -1395,6 +1415,7 @@ def solve_static_terrain_constraint(
         nonlocal normal_iterations
         nonlocal friction_iterations
         nonlocal projection_speed_source
+        nonlocal last_normal_impulse_direction
 
         min_correction_threshold = solver_min_correction_initial
         projection_pv, start_speed, pass_projection_source = projected_velocity(pass_target_separation)
@@ -1418,7 +1439,14 @@ def solve_static_terrain_constraint(
             if eff_normal <= 1e-8:
                 break
             normal_impulse = correction / eff_normal
-            apply_impulse(normal, normal_impulse)
+            impulse_direction = normal
+            if (
+                projection_impulse_sign_mode == "match_projection"
+                and pass_projection_source != "body_minus_world"
+            ):
+                impulse_direction = (-normal[0], -normal[1], -normal[2])
+            last_normal_impulse_direction = impulse_direction
+            apply_impulse(impulse_direction, normal_impulse)
             accumulated_normal_impulse += normal_impulse
             normal_iterations += 1
             pass_iterations += 1
@@ -1497,7 +1525,7 @@ def solve_static_terrain_constraint(
     restitution_impulse = 0.0
     if accumulated_normal_impulse > 0.0001 and float(restitution_fraction) > 0.0:
         restitution_impulse = accumulated_normal_impulse * float(restitution_fraction)
-        apply_impulse(normal, restitution_impulse)
+        apply_impulse(last_normal_impulse_direction, restitution_impulse)
 
     pv_after = point_velocity()
     center_normal_after = _vec3_dot(vel, normal)
@@ -1521,6 +1549,7 @@ def solve_static_terrain_constraint(
         "constraint_record_order_source": "inferred_entity_vs_world_body_positive_impulse",
         "constraint_projection_model": "Constraint_compute_velocity_projection_body_minus_world",
         "constraint_projection_order": projection_order_key,
+        "constraint_projection_impulse_sign_mode": projection_impulse_sign_mode,
         "constraint_projection_speed_source": projection_speed_source,
         "constraint_primary_projection_speed_source": primary_projection_speed_source,
         "constraint_world_point_velocity_before": world_point_velocity,
@@ -1533,9 +1562,13 @@ def solve_static_terrain_constraint(
         "constraint_selected_separation_speed_before": primary_start_separation_speed,
         "constraint_separation_speed_before": point_normal_before,
         "constraint_opposite_separation_speed_before": opposite_point_normal_before,
-        "normal_impulse_body_sign": 1.0,
-        "normal_impulse_world_sign": -1.0,
-        "normal_impulse_body_direction": normal,
+        "normal_impulse_body_sign": (
+            -1.0 if last_normal_impulse_direction != normal else 1.0
+        ),
+        "normal_impulse_world_sign": (
+            1.0 if last_normal_impulse_direction != normal else -1.0
+        ),
+        "normal_impulse_body_direction": last_normal_impulse_direction,
         "position_correction": position_correction,
         "position_correction_cap": correction_limit,
         "normal_velocity_before": center_normal_before,
