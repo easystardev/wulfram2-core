@@ -1915,7 +1915,11 @@ def _matrix3_from_axis_angle_shared(
     angle_sq = omega_x * omega_x + omega_y * omega_y + omega_z * omega_z
     angle_f64 = math.sqrt(angle_sq)
     angle = _f32_shared(angle_f64)
-    if angle < 1e-05:
+    # A degenerate pose can overflow omega to inf/NaN; sqrt then yields a
+    # non-finite angle and math.cos(inf) raises "math domain error". An
+    # infinite/NaN axis-angle has no valid rotation, so treat it (like a
+    # sub-threshold angle) as identity to keep the attitude step finite.
+    if not math.isfinite(angle_f64) or angle < 1e-05:
         return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
     inv_len = _f32_shared(1.0 / angle)
