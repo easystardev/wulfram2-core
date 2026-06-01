@@ -5,6 +5,7 @@ Builder functions remain in the server module; this file provides
 the enums, constants, and compression helpers they depend on.
 """
 
+import math
 import os
 from typing import Optional
 
@@ -220,6 +221,15 @@ LOCAL_STATE_TURRET_PRIORITY = int(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_PRI
 
 def compress_value(val: float, max_val: float, range_val: float, total_bits: int = 16) -> int:
     """Compress a value using the same inverse quantization as wulf-forge."""
+    if not math.isfinite(val):
+        # TOTAL SERIALIZER GUARD: this quantizer is on every replication path
+        # (UPDATE_ARRAY / state-sync), called from BOTH the per-client tick loop
+        # and the shared UDP thread. A non-finite physics value (e.g. an attitude
+        # acos/asin domain NaN, or a spring-instability inf) must never reach
+        # int(NaN) below and crash the thread — encode it as the neutral 0 value
+        # so the packet stays well-formed and the server keeps running. Fires
+        # ONLY on already-broken (non-finite) input. (A3 soak, 2026-06-01.)
+        return 0
     min_val = max_val - range_val
     if val == 0.0:
         return 0

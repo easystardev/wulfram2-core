@@ -2306,6 +2306,14 @@ def piecewise_interpolate(
     if len(values) == 1:
         return values[0]
     v = float(value)
+    if not math.isfinite(v):
+        # PARITY-SAFE NaN/inf GUARD: a softbody spring instability on rough/steep
+        # terrain can drive a per-point velocity (the curve input) to NaN/inf,
+        # which would crash int(math.floor(NaN)) below and spam the server tick
+        # loop. Treat a non-finite input as the domain-min endpoint (same as the
+        # `v <= lo` clamp). Fires ONLY on already-broken (non-finite) input, so
+        # it can never change normal finite-input results. (A3 soak, 2026-06-01.)
+        return values[0]
     lo = float(domain_min)
     hi = float(domain_max)
     if hi <= lo:

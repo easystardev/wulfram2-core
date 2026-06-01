@@ -3,6 +3,7 @@ Codec layer: BitWriter/BitReader and packet encoding utilities.
 Pure functions - no I/O, no state.
 """
 
+import math
 import struct
 from typing import Tuple, Optional
 
@@ -138,6 +139,11 @@ def quantize_float(value: float, max_val: float, range_val: float, total_bits: i
 
     Zero maps to raw=0 (special case).
     """
+    if not math.isfinite(value):
+        # TOTAL SERIALIZER GUARD: never let a non-finite physics value reach
+        # int(NaN) below and crash a replication thread; encode neutral 0.
+        # Fires only on already-broken input. (A3 soak, 2026-06-01.)
+        return 0
     if value == 0.0:
         return 0
 
