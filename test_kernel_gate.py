@@ -22,11 +22,24 @@ def _fb(x):
     return struct.pack("<f", x)
 
 
+def _dll_loads() -> bool:
+    try:
+        import importlib
+        importlib.import_module("wulfram2_protocol.sim_kernel.native")
+        return True
+    except Exception:
+        return False
+
+
 def main() -> int:
-    requested = os.environ.get("WULFRAM_NATIVE_KERNEL", "").strip().lower() not in (
-        "", "0", "false", "no", "off",
-    )
-    expected = "native" if requested else "python"
+    env = os.environ.get("WULFRAM_NATIVE_KERNEL", "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        expected = "python"
+    elif env == "":
+        # Default: prefer native, fall back to python only if the DLL won't load.
+        expected = "native" if _dll_loads() else "python"
+    else:
+        expected = "native"
     if sim_kernel.KERNEL_BACKEND != expected:
         print(f"  FAIL  backend={sim_kernel.KERNEL_BACKEND!r} expected {expected!r}")
         return 1
