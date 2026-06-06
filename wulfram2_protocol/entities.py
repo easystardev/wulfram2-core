@@ -8,10 +8,11 @@ from typing import Callable, Mapping, Optional, Sequence, Tuple
 import math
 
 # Single shared sim kernel (CH1): the rotation/attitude primitives live in
-# exactly one place — wulfram2_protocol.sim_kernel.rotation. The `_shared`
-# names below are thin adapters over it so the spring/body-matrix math here
-# shares the SAME kernel as server and client (no third partial copy).
-from wulfram2_protocol.sim_kernel.rotation import (  # noqa: F401
+# exactly one place — wulfram2_protocol.sim_kernel. The `_shared` names below
+# are thin adapters over it so the spring/body-matrix math here shares the SAME
+# kernel as server and client (no third partial copy). Backend (pure-Python vs
+# native C) is selected by WULFRAM_NATIVE_KERNEL; both are bit-for-bit identical.
+from wulfram2_protocol.sim_kernel import (  # noqa: F401
     F32_TWO_PI as _F32_TWO_PI,
     extract_euler_angles as _extract_euler_angles_canon,
     f32 as _f32_shared,

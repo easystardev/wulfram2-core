@@ -72,6 +72,11 @@ def f32(value: float) -> float:
     return float(_LIB.wf_f32(value))
 
 
+# Float32 2*pi constant — same value the C kernel uses (the single-precision
+# 6.2831855). Exposed so this backend is a drop-in for rotation.py.
+F32_TWO_PI = f32(6.2831855)
+
+
 def normalize_angle_client(angle: float) -> float:
     return float(_LIB.wf_normalize_angle_client(angle))
 
