@@ -6,7 +6,19 @@ from enum import IntEnum
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 import math
-import struct
+
+# Single shared sim kernel (CH1): the rotation/attitude primitives live in
+# exactly one place — wulfram2_protocol.sim_kernel.rotation. The `_shared`
+# names below are thin adapters over it so the spring/body-matrix math here
+# shares the SAME kernel as server and client (no third partial copy).
+from wulfram2_protocol.sim_kernel.rotation import (  # noqa: F401
+    F32_TWO_PI as _F32_TWO_PI,
+    extract_euler_angles as _extract_euler_angles_canon,
+    f32 as _f32_shared,
+    matrix3_from_axis_angle,
+    matrix3_from_euler_xyz,
+    normalize_angle_client as _normalize_angle_positive_shared,
+)
 
 
 class BehaviorSlot(IntEnum):
@@ -1869,100 +1881,18 @@ def tank_spring_attitude_step(
 
 
 def _matrix3_from_euler_xyz_shared(ex: float, ey: float, ez: float) -> tuple[float, ...]:
-    """Build the row-major XYZ rotation matrix used by the decompiled client."""
-    cx = math.cos(ex)
-    sx = math.sin(ex)
-    cy = math.cos(ey)
-    sy = math.sin(ey)
-    cz = math.cos(ez)
-    sz = math.sin(ez)
-    return (
-        cz * cy,
-        cz * sy * sx - sz * cx,
-        sz * sx + cz * cx * sy,
-        sz * cy,
-        sy * sx * sz + cz * cx,
-        sy * cx * sz - cz * sx,
-        -sy,
-        cy * sx,
-        cx * cy,
-    )
-
-
-def _f32_shared(value: float) -> float:
-    return struct.unpack("f", struct.pack("f", float(value)))[0]
-
-
-_F32_TWO_PI = _f32_shared(6.2831855)
-
-
-def _normalize_angle_positive_shared(angle: float) -> float:
-    out = _f32_shared(angle)
-    if out > 20000.0 or out < -20000.0:
-        return 0.0
-    while out < 0.0:
-        out = _f32_shared(out + _F32_TWO_PI)
-    while out > _F32_TWO_PI:
-        out = _f32_shared(out - _F32_TWO_PI)
-    return out
-
-
-def _matrix3_from_axis_angle_shared(
-    omega_x: float,
-    omega_y: float,
-    omega_z: float,
-) -> tuple[float, ...]:
-    angle_sq = omega_x * omega_x + omega_y * omega_y + omega_z * omega_z
-    angle_f64 = math.sqrt(angle_sq)
-    angle = _f32_shared(angle_f64)
-    # A degenerate pose can overflow omega to inf/NaN; sqrt then yields a
-    # non-finite angle and math.cos(inf) raises "math domain error". An
-    # infinite/NaN axis-angle has no valid rotation, so treat it (like a
-    # sub-threshold angle) as identity to keep the attitude step finite.
-    if not math.isfinite(angle_f64) or angle < 1e-05:
-        return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-
-    inv_len = _f32_shared(1.0 / angle)
-    nx = _f32_shared(omega_x * inv_len)
-    ny = _f32_shared(omega_y * inv_len)
-    nz = _f32_shared(omega_z * inv_len)
-    c = _f32_shared(math.cos(angle_f64))
-    s = _f32_shared(math.sin(angle_f64))
-    t = _f32_shared(1.0 - c)
-    t_nx = _f32_shared(nx * t)
-    t_ny = _f32_shared(ny * t)
-    t_nz = _f32_shared(nz * t)
-
-    return (
-        _f32_shared(_f32_shared(nx * t_nx) + c),
-        _f32_shared(_f32_shared(ny * t_nx) + _f32_shared(nz * s)),
-        _f32_shared(_f32_shared(t_nx * nz) - _f32_shared(ny * s)),
-        _f32_shared(_f32_shared(t_ny * nx) - _f32_shared(nz * s)),
-        _f32_shared(_f32_shared(ny * t_ny) + c),
-        _f32_shared(_f32_shared(t_ny * nz) + _f32_shared(nx * s)),
-        _f32_shared(_f32_shared(nx * t_nz) + _f32_shared(ny * s)),
-        _f32_shared(_f32_shared(ny * t_nz) - _f32_shared(nx * s)),
-        _f32_shared(_f32_shared(nz * t_nz) + c),
-    )
+    """Row-major XYZ rotation matrix (shared kernel; tuple for this module's contract)."""
+    return tuple(matrix3_from_euler_xyz(ex, ey, ez))
 
 
 def _extract_euler_angles_shared(matrix: Sequence[float]) -> tuple[float, float, float]:
-    fm0 = _f32_shared(float(matrix[0]))
-    fm1 = _f32_shared(float(matrix[1]))
-    fm3 = _f32_shared(float(matrix[3]))
-    fm6 = _f32_shared(float(matrix[6]))
-    fm7 = _f32_shared(float(matrix[7]))
-    fm8 = _f32_shared(float(matrix[8]))
-    gimbal = math.sqrt(fm0 * fm0 + fm1 * fm1)
+    """Euler XYZ from a row-major matrix, normalized to [0, 2*pi].
 
-    if gimbal <= 1.9073486328125e-06:
-        euler_x = _f32_shared(math.atan2(fm7, fm8))
-        euler_y = _f32_shared(math.atan2(-fm6, gimbal))
-        euler_z = 0.0
-    else:
-        euler_x = _f32_shared(math.atan2(fm7, fm8))
-        euler_y = _f32_shared(math.atan2(-fm6, gimbal))
-        euler_z = _f32_shared(math.atan2(fm3, fm0))
+    The shared kernel's `extract_euler_angles` returns RAW float32 atan2 values;
+    this spring/body-matrix consumer wants them normalized, matching the prior
+    `_extract_euler_angles_shared` contract bit-for-bit.
+    """
+    euler_x, euler_y, euler_z = _extract_euler_angles_canon(matrix)
     return (
         _normalize_angle_positive_shared(euler_x),
         _normalize_angle_positive_shared(euler_y),
@@ -2046,7 +1976,7 @@ def matrix3_integrate_angular_shared(
         _f32_shared(float(angular_velocity[1]) * fdt),
         _f32_shared(float(angular_velocity[2]) * fdt),
     )
-    delta = _matrix3_from_axis_angle_shared(omega[0], omega[1], omega[2])
+    delta = matrix3_from_axis_angle(omega[0], omega[1], omega[2])
     source = tuple(_f32_shared(float(v)) for v in tuple(matrix)[:9])
     if len(source) != 9:
         source = _matrix3_from_euler_xyz_shared(0.0, 0.0, 0.0)
