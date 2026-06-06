@@ -45,6 +45,15 @@ WF_API void wf_matrix3_from_axis_angle(double omega_x, double omega_y,
  * Returns RAW float32 euler (NOT normalized), matching extract_euler_angles. */
 WF_API void wf_extract_euler_angles(const double m[9], float out3[3]);
 
+/* Verlet position step + float32 quantize. `acc` is the already
+ * collision-adjusted damped acceleration. in_pos/in_vel/acc are 3 doubles;
+ * out_pos/out_vel are 3 doubles holding the float32-quantized results.
+ * Mirrors integrate_verlet (rotation.py): arithmetic in double, wf_f32() only
+ * at the final store; position uses the OLD velocity. */
+WF_API void wf_integrate_verlet(const double in_pos[3], const double in_vel[3],
+                                const double acc[3], double dt,
+                                double out_pos[3], double out_vel[3]);
+
 #ifdef __cplusplus
 }
 #endif

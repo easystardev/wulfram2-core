@@ -180,3 +180,37 @@ def extract_euler_angles(m) -> tuple:
         euler_z = f32(math.atan2(fm3, fm0))
 
     return (euler_x, euler_y, euler_z)
+
+
+def integrate_verlet(pos, vel, acc, dt):
+    """One Verlet position step + float32 quantization (the rounding-bearing core).
+
+    Mirrors the "Verlet integration" block of the client/server physics step
+    (client physics.py): given the already collision-adjusted *damped*
+    acceleration `acc`, advance position and velocity one step and quantize both
+    to float32 — the contract surface's rounding point.
+
+      half_dt2 = 0.5 * dt * dt
+      pos' = f32(pos + vel*dt + acc*half_dt2)   # position uses the OLD velocity
+      vel' = f32(vel + acc*dt)
+
+    Control flow (acc computation, ground/terrain clamps) stays in the caller;
+    only the rounding-sensitive arithmetic lives here. Intermediates are carried
+    in float64 and f32() is applied ONLY at the final store, exactly as the
+    original client does.
+
+    pos/vel/acc are 3-sequences of float; returns (out_pos, out_vel) as
+    3-tuples of float32-quantized floats.
+    """
+    half_dt2 = 0.5 * dt * dt
+    out_pos = (
+        f32(pos[0] + vel[0] * dt + acc[0] * half_dt2),
+        f32(pos[1] + vel[1] * dt + acc[1] * half_dt2),
+        f32(pos[2] + vel[2] * dt + acc[2] * half_dt2),
+    )
+    out_vel = (
+        f32(vel[0] + acc[0] * dt),
+        f32(vel[1] + acc[1] * dt),
+        f32(vel[2] + acc[2] * dt),
+    )
+    return out_pos, out_vel

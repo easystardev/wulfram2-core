@@ -68,6 +68,26 @@ EULER_CASES = [
 ))
 
 
+INTEGRATE_CASES = [
+    # (pos, vel, acc, dt)
+    ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 1.0 / 30.0),
+    ((100.0, 200.0, 3.377), (1.5, -0.5, 0.0), (0.2, -0.1, -9.8), 0.084),
+    ((5183.0, 3072.0, 2.427), (0.0, 0.0, 0.0), (0.0, 0.0, 0.95), 0.084),
+    ((-12.5, 7.25, 30.0), (-3.3, 2.2, -1.1), (0.5, -0.5, 0.5), 1.0 / 30.0),
+] + list(zip(
+    list(zip(_seeded_floats(120, -6000.0, 6000.0, 9),
+             _seeded_floats(120, -6000.0, 6000.0, 10),
+             _seeded_floats(120, 0.0, 60.0, 11))),
+    list(zip(_seeded_floats(120, -50.0, 50.0, 12),
+             _seeded_floats(120, -50.0, 50.0, 13),
+             _seeded_floats(120, -50.0, 50.0, 14))),
+    list(zip(_seeded_floats(120, -20.0, 20.0, 15),
+             _seeded_floats(120, -20.0, 20.0, 16),
+             _seeded_floats(120, -20.0, 20.0, 17))),
+    _seeded_floats(120, 0.01, 0.12, 18),
+))
+
+
 def _check(name, fails, cond, detail):
     if not cond:
         fails.append(f"{name}: {detail}")
@@ -123,6 +143,19 @@ def test_extract_euler_angles():
     assert not fails, "\n".join(fails[:20])
 
 
+def test_integrate_verlet():
+    fails = []
+    for (pos, vel, acc, dt) in INTEGRATE_CASES:
+        a = py.integrate_verlet(pos, vel, acc, dt)
+        b = nv.integrate_verlet(pos, vel, acc, dt)
+        for part in range(2):  # 0 = pos, 1 = vel
+            for i in range(3):
+                _check("integrate", fails, _f_bits(a[part][i]) == _f_bits(b[part][i]),
+                       f"{(pos, vel, acc, dt)} part{part}[{i}]: "
+                       f"py={a[part][i]!r} nv={b[part][i]!r}")
+    assert not fails, "\n".join(fails[:20])
+
+
 def main():
     tests = [
         ("f32", test_f32),
@@ -130,6 +163,7 @@ def main():
         ("matrix3_from_euler_xyz", test_matrix3_from_euler_xyz),
         ("matrix3_from_axis_angle", test_matrix3_from_axis_angle),
         ("extract_euler_angles", test_extract_euler_angles),
+        ("integrate_verlet", test_integrate_verlet),
     ]
     rc = 0
     for name, fn in tests:

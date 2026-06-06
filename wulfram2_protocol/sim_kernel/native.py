@@ -62,6 +62,13 @@ def _load():
     lib.wf_extract_euler_angles.argtypes = [
         ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_float),
     ]
+
+    lib.wf_integrate_verlet.restype = None
+    lib.wf_integrate_verlet.argtypes = [
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double), ctypes.c_double,
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
+    ]
     return lib
 
 
@@ -98,3 +105,16 @@ def extract_euler_angles(m) -> tuple:
     out = (ctypes.c_float * 3)()
     _LIB.wf_extract_euler_angles(arr, out)
     return tuple(float(out[i]) for i in range(3))
+
+
+def integrate_verlet(pos, vel, acc, dt):
+    in_pos = (ctypes.c_double * 3)(*[float(pos[i]) for i in range(3)])
+    in_vel = (ctypes.c_double * 3)(*[float(vel[i]) for i in range(3)])
+    in_acc = (ctypes.c_double * 3)(*[float(acc[i]) for i in range(3)])
+    out_pos = (ctypes.c_double * 3)()
+    out_vel = (ctypes.c_double * 3)()
+    _LIB.wf_integrate_verlet(in_pos, in_vel, in_acc, float(dt), out_pos, out_vel)
+    return (
+        (out_pos[0], out_pos[1], out_pos[2]),
+        (out_vel[0], out_vel[1], out_vel[2]),
+    )

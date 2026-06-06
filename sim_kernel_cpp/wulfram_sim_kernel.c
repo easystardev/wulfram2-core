@@ -135,3 +135,29 @@ void wf_extract_euler_angles(const double m[9], float out3[3]) {
         out3[2] = wf_f32(atan2((double)fm3, (double)fm0));
     }
 }
+
+/* --------------------------------------------------------------------------
+ * wf_integrate_verlet: one Verlet position step + float32 quantize.
+ * Mirrors integrate_verlet (rotation.py). Read the two side by side.
+ *
+ * Python spec (the contract — match it bit-for-bit):
+ *     half_dt2 = 0.5 * dt * dt
+ *     out_pos[i] = f32(in_pos[i] + in_vel[i]*dt + acc[i]*half_dt2)
+ *     out_vel[i] = f32(in_vel[i] + acc[i]*dt)
+ *
+ * Discipline (the whole point of moving this to C): carry every intermediate
+ * in `double` and call wf_f32() ONLY at the final store, exactly where the
+ * Python f32() sits. Do NOT f32 half_dt2 or the partial sums. Position uses the
+ * OLD in_vel (not the post-step velocity).
+ * ------------------------------------------------------------------------*/
+void wf_integrate_verlet(const double in_pos[3], const double in_vel[3],
+                         const double acc[3], double dt,
+                         double out_pos[3], double out_vel[3]) {
+    double half_dt2 = 0.5 * dt * dt;
+    for (int i = 0; i < 3; i++) {
+        /* Carry the sum in double; round to float32 ONLY at the store, exactly
+         * where the Python f32() sits. Position uses the OLD velocity. */
+        out_pos[i] = wf_f32(in_pos[i] + in_vel[i] * dt + acc[i] * half_dt2);
+        out_vel[i] = wf_f32(in_vel[i] + acc[i] * dt);
+    }
+}
