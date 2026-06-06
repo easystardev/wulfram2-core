@@ -1,22 +1,19 @@
 """Canonical rotation/attitude kernel — the single shared copy.
 
-Matches the Wulfram2 client's EXACT angular integration primitives from the
-azurefishy decompile: a 3x3 rotation matrix (row-major doubles) with axis-angle
-Rodrigues construction, float32 matrix multiply, and atan2 euler extraction.
-
-azurefishy-src references (file:line; verified 2026-06-01):
-  - GUESS3_Matrix3_from_axis_angle       System/Core/Math.c:2774   Rodrigues, float32
-  - GUESS5_Matrix3_integrate_angular     Game/Simulation/Physics.c:5169  angular integ.
-  - GUESS5_Matrix3_from_euler_xyz        System/Core/Math.c:606    Euler→matrix rebuild
-  - GUESS2_Vec3_normalize_safe           System/Core/Math.c:2358   Euler extraction atan2
-  - GUESS3_Math_normalize_angle_radians  System/Core/Math.c:2744   iterative [0, 2*pi]
+Reproduces the original Wulfram II client's EXACT angular integration primitives:
+a 3x3 rotation matrix (row-major doubles) with axis-angle Rodrigues
+construction, float32 matrix multiply, and atan2 euler extraction. Faithfulness
+is verified empirically against captured original-client behavior (the byte-exact
+regression corpus).
 
 This module is the ONE place these function bodies live. `server/wulfram/
 physics.py`, `client/wulfram_client/simulation/physics.py`, and the `_shared`
 family in `shared/wulfram2_protocol/entities.py` are thin adapters over it.
 
-Everything operates in float32 (`f32`) exactly where the decompile does so the
-kernel is bit-for-bit reproducible (exact IEEE-754 hex; the determinism contract).
+Everything operates in float32 (`f32`) exactly where the original client does so
+the kernel is bit-for-bit reproducible (exact IEEE-754 hex; the determinism
+contract). Where the original carried a wider intermediate than float64 can
+represent, this is noted inline as a documented divergence.
 """
 
 import array as _array
@@ -31,20 +28,19 @@ _f32_buf = _array.array("f", [0.0])
 
 
 def f32(value: float) -> float:
-    """Round-trip a float through float32 to match the client's x86 precision."""
+    """Round-trip a float through float32 to match the original client's single-precision storage."""
     _f32_buf[0] = value
     return _f32_buf[0]
 
 
-# Float32 2*pi constant from the decompile (exact value used in
-# Math_normalize_angle_radians).
+# Float32 2*pi constant — the exact single-precision value the original client
+# uses for angle wrapping.
 F32_TWO_PI = f32(6.2831855)
 
 
 def normalize_angle_client(angle: float) -> float:
-    """Normalize angle to [0, 2*pi] matching Math_normalize_angle_radians.
+    """Normalize angle to [0, 2*pi] matching the original client.
 
-    From the decompile (GUESS3_Math_normalize_angle_radians, Math.c:2744):
       - Safety clamp: |angle| > 20000 -> 0.0
       - Iterative add/subtract of 6.2831855f (float32 2*pi), all in float32.
     """
@@ -61,10 +57,14 @@ def normalize_angle_client(angle: float) -> float:
 def matrix3_from_euler_xyz(ex: float, ey: float, ez: float) -> list:
     """Build a 3x3 rotation matrix from euler XYZ angles (row-major doubles).
 
-    Matches GUESS5_Matrix3_from_euler_xyz (Math.c:606). XYZ intrinsic order:
-    R = Rz * Ry * Rx. Input: X=roll, Y=pitch, Z=heading. Output: 9-element
-    row-major list of doubles (client entity+0x58). Trig at float64 (Python
-    ~= x87 extended), matching the decompile's (float10)(double) casts.
+    XYZ intrinsic order: R = Rz * Ry * Rx. Input: X=roll, Y=pitch, Z=heading.
+    Output: 9-element row-major list of doubles, stored in the client's entity
+    rotation matrix slot. Trig and products run at float64.
+
+    DIVERGENCE (platform-bounded): the original carried the trig/products in an
+    extended-precision intermediate wider than float64. That width is not
+    available on this target, so float64 is used; the residual is below the
+    float32 extraction that always follows, and is corpus-validated.
 
     Returns a *list* because callers (server VehiclePhysics._matrix) mutate the
     result in place during the matrix-multiply write-back.
@@ -92,25 +92,30 @@ def matrix3_from_euler_xyz(ex: float, ey: float, ez: float) -> list:
 def matrix3_from_axis_angle(omega_x: float, omega_y: float, omega_z: float) -> tuple:
     """Build a 3x3 rotation matrix from an axis-angle vector via Rodrigues.
 
-    Matches GUESS3_Matrix3_from_axis_angle (Math.c:2774). Input: axis-angle
-    vector (3 float32). Angle = ||vector||, axis = vector/||vector||. Output:
-    9-element row-major tuple of float32 values.
+    Input: axis-angle vector (3 float32). Angle = ||vector||, axis =
+    vector/||vector||. Output: 9-element row-major tuple of float32 values.
 
-    All arithmetic in float32 except sqrt/cos/sin (x87 extended) then cast to
-    float32.
+    All algebraic arithmetic is per-op float32; sqrt/cos/sin run at float64 then
+    cast to float32.
 
-    A degenerate pose can overflow omega to inf/NaN; sqrt then yields a
-    non-finite angle and math.cos(inf) raises "math domain error". An
-    infinite/NaN axis-angle has no valid rotation, so treat it (like a
-    sub-threshold angle) as identity to keep the attitude step finite
-    (regression: shared/test_attitude_finite.py).
+    DIVERGENCE (intentional safety extension): a degenerate pose can overflow
+    omega to inf/NaN; sqrt then yields a non-finite angle and math.cos(inf)
+    raises "math domain error". The original has no such guard and would emit a
+    NaN matrix. An infinite/NaN axis-angle has no valid rotation, so we treat it
+    (like a sub-threshold angle) as identity to keep the attitude step finite.
+    Affects only inputs outside the original's valid domain.
+    Regression: shared/test_attitude_finite.py.
     """
     angle_sq = omega_x * omega_x + omega_y * omega_y + omega_z * omega_z
-    angle_f64 = math.sqrt(angle_sq)  # extended precision (Python float64 ~= x87)
+    angle_f64 = math.sqrt(angle_sq)
     angle = f32(angle_f64)
 
-    # Identity threshold: angle < 1e-05 (from decompile); also guard non-finite.
-    if not math.isfinite(angle_f64) or angle < 1e-05:
+    # Identity threshold. The original source uses `<= 1e-05`. 1e-05 is not
+    # float32-representable, so for any float32 `angle` the `== 1e-05` arm is
+    # unsatisfiable and `<=` collapses to `<` -- identical output, but we keep
+    # `<=` to match the original source. The isfinite() guard is the intentional
+    # safety extension documented above.
+    if not math.isfinite(angle_f64) or angle <= 1e-05:
         return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
     inv_len = f32(1.0 / angle)
@@ -118,7 +123,7 @@ def matrix3_from_axis_angle(omega_x: float, omega_y: float, omega_z: float) -> t
     ny = f32(omega_y * inv_len)
     nz = f32(omega_z * inv_len)
 
-    # cos/sin via x87 extended precision (angle still on FPU stack), cast f32.
+    # cos/sin at float64, then cast to float32.
     c = f32(math.cos(angle_f64))
     s = f32(math.sin(angle_f64))
     t = f32(1.0 - c)  # 1 - cos(angle)
@@ -144,9 +149,8 @@ def matrix3_from_axis_angle(omega_x: float, omega_y: float, omega_z: float) -> t
 def extract_euler_angles(m) -> tuple:
     """Extract XYZ euler angles from a 3x3 rotation matrix via atan2.
 
-    Matches GUESS2_Vec3_normalize_safe (Math.c:2358) — euler extraction despite
-    the misleading name. atan2 arguments come from matrix elements on the FPU
-    stack:
+    Reproduces the original client's euler extraction. atan2 arguments come from
+    the matrix elements:
       euler_x (roll)    = atan2(M[7], M[8])
       euler_y (pitch)   = atan2(-M[6], sqrt(M[0]^2 + M[1]^2))
       euler_z (heading) = atan2(M[3], M[0])
@@ -163,16 +167,16 @@ def extract_euler_angles(m) -> tuple:
     fm7 = f32(m[7])
     fm8 = f32(m[8])
 
-    # Gimbal-lock check: sqrt(M[0][0]^2 + M[1][0]^2) on the FPU stack.
+    # Gimbal-lock check: sqrt(M[0][0]^2 + M[1][0]^2).
     gimbal = math.sqrt(fm0 * fm0 + fm1 * fm1)
 
-    if gimbal <= 1.9073486328125e-06:  # 2^(-19), from decompile
+    if gimbal <= 1.9073486328125e-06:  # 2^(-19)
         euler_x = f32(math.atan2(fm7, fm8))
         euler_y = f32(math.atan2(-fm6, gimbal))
         euler_z = 0.0
     else:
         euler_x = f32(math.atan2(fm7, fm8))
-        euler_y = f32(float(math.atan2(-fm6, gimbal)))  # extra double cast per decompile
+        euler_y = f32(float(math.atan2(-fm6, gimbal)))  # extra double cast (matches original)
         euler_z = f32(math.atan2(fm3, fm0))
 
     return (euler_x, euler_y, euler_z)

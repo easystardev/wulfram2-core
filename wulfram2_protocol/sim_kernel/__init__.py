@@ -9,8 +9,8 @@ during server iteration (precondition for using the clone as a server oracle —
 see docs/precise-clone-goal-loop.md, GOAL CH1).
 
 Determinism is the contract: every function operates in float32 (`f32`) exactly
-where the azurefishy decompile does, so results are bit-for-bit reproducible and
-comparable as exact IEEE-754 hex.
+where the original Wulfram II client does, so results are bit-for-bit
+reproducible and comparable as exact IEEE-754 hex.
 """
 
 from .rotation import (

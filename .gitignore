@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 uv.lock
+
+# Native sim kernel build artifacts (built via sim_kernel_cpp/build.ps1)
+sim_kernel_cpp/*.dll
+sim_kernel_cpp/*.lib
+sim_kernel_cpp/*.exp
+sim_kernel_cpp/*.o
+sim_kernel_cpp/*.obj
