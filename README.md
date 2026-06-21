@@ -69,4 +69,6 @@ It is focused on interoperability: shared wire-format definitions, codec helpers
 
 ## License
 
-Educational and preservation-oriented reverse-engineering work.
+[MIT](LICENSE). Independent, fan-made preservation / reverse-engineering work —
+not affiliated with the original developers or rights holders, and ships no
+original game assets or binaries.
