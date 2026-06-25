@@ -1,8 +1,8 @@
-# Wulfram2 Protocol
+# Wulfram2 Core
 
-Shared Python protocol layer for the Wulfram II revival work.
+Shared Python core layer for the Wulfram II revival work: the wire protocol **and** the deterministic sim/physics kernel.
 
-This repo contains the wire-format codec, packet constants, quantizer helpers, shared entity definitions, and gameplay constants used by both the Python server and Python client work.
+This repo contains the wire-format codec, packet constants, quantizer helpers, shared entity definitions, gameplay constants, and the shared deterministic simulation kernel (`sim_kernel_cpp/`) used by both the Python server and Python client work.
 
 ## Package
 
@@ -44,7 +44,7 @@ Example:
 mkdir C:\dev\wulfram-runtime
 cd C:\dev\wulfram-runtime
 git clone https://github.com/easystardev/wulfram-server.git server
-git clone https://github.com/easystardev/wulfram2-protocol.git shared
+git clone https://github.com/easystardev/wulfram2-core.git shared
 ```
 
 You can also install it into an environment if you want direct imports:
