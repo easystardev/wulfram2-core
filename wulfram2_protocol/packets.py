@@ -7,6 +7,7 @@ the enums, constants, and compression helpers they depend on.
 
 import math
 import os
+from .hud_state import HUD_FRACTION_MAX, HUD_FRACTION_RANGE, validate_hud_fraction_schema
 from typing import Optional
 
 
@@ -303,8 +304,8 @@ def write_local_player_state(bw, include: bool,
                              primary_turret_angle: float = 0.0,
                              secondary_turret_bits: int = 0,
                              secondary_turret_angle: float = 0.0,
-                             turret_max: float = 6.3,
-                             turret_range: float = 12.6,
+                             turret_max: float = HUD_FRACTION_MAX,
+                             turret_range: float = HUD_FRACTION_RANGE,
                              include_ammo_turrets: bool = True) -> None:
     """Write local player state block used by UPDATE_ARRAY and PLAYER_INFO.
 
@@ -328,11 +329,19 @@ def write_local_player_state(bw, include: bool,
     if include_ammo_turrets and ammo_count_bits > 0:
         bw.write_bits(ammo_count_bits, ammo_count & ((1 << ammo_count_bits) - 1))
 
+    # Legacy names retained for callers. These values are HUD fractions:
+    # primary=slot-4 pulse charge, secondary=slot-1 repair fraction.
     if include_ammo_turrets and primary_turret_bits:
+        validate_hud_fraction_schema(primary_turret_bits, turret_max, turret_range)
+        if LOCAL_STATE_TURRET_HEADER_BITS:
+            raise ValueError("HUD fraction fields do not have a priority header")
         if LOCAL_STATE_TURRET_HEADER_BITS > 0:
             bw.write_bits(LOCAL_STATE_TURRET_HEADER_BITS, LOCAL_STATE_TURRET_PRIORITY & ((1 << LOCAL_STATE_TURRET_HEADER_BITS) - 1))
         bw.write_bits(primary_turret_bits, compress_value(primary_turret_angle, turret_max, turret_range, total_bits=primary_turret_bits))
     if include_ammo_turrets and secondary_turret_bits:
+        validate_hud_fraction_schema(secondary_turret_bits, turret_max, turret_range)
+        if LOCAL_STATE_TURRET_HEADER_BITS:
+            raise ValueError("HUD fraction fields do not have a priority header")
         if LOCAL_STATE_TURRET_HEADER_BITS > 0:
             bw.write_bits(LOCAL_STATE_TURRET_HEADER_BITS, LOCAL_STATE_TURRET_PRIORITY & ((1 << LOCAL_STATE_TURRET_HEADER_BITS) - 1))
         bw.write_bits(secondary_turret_bits, compress_value(secondary_turret_angle, turret_max, turret_range, total_bits=secondary_turret_bits))
@@ -352,7 +361,10 @@ def write_update_array_entity(bw,
                               spin=(0.0, 0.0, 0.0),
                               include_entity_vitals: bool = False,
                               speed_scale: float = 1.0,
-                              fuel: float = 1.0) -> None:
+                              fuel: float = 1.0,
+                              ammo_unit: Optional[int] = None,
+                              ammo_active_bits: int = 0,
+                              ammo_active_mask: int = 0) -> None:
     """Write a single entity update block to an UPDATE_ARRAY bitstream."""
     bw.write_bits(32, entity_id)
     bw.write_bits(1, 1 if is_manned else 0)
@@ -369,6 +381,10 @@ def write_update_array_entity(bw,
     if include_entity_vitals:
         update_mask |= (1 << 5)
         update_mask |= (1 << 7)
+    if ammo_unit is not None:
+        if int(ammo_unit) != 0 or int(ammo_active_bits) != 9:
+            raise ValueError("only Tank ammo unit 0 with active width 9 is supported")
+        update_mask |= (1 << 6)
     bw.write_bits(10, update_mask)
 
     bw.write_bits(16, 0)  # Bank selector
@@ -396,7 +412,19 @@ def write_update_array_entity(bw,
     if include_entity_vitals:
         if ENTITY_VITALS_MODE in ("health", "vitals"):
             bw.write_bits(10, encode_health_bits(speed_scale, total_bits=10))
-            bw.write_bits(10, encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
         else:
             bw.write_bits(10, compress_value(speed_scale, 1.0, 1.0, total_bits=10))
+
+    # Bounded Tank ammo state. The emitted Tank BEHAVIOR row has property
+    # widths (count=0, enabled=0, active=9, word=0), so only its unit and
+    # property-3 mask occur on wire. Other rows require a generalized schema.
+    if ammo_unit is not None:
+        bw.write_bits(5, int(ammo_unit) & 0x1F)
+        if ammo_active_bits:
+            bw.write_bits(ammo_active_bits, int(ammo_active_mask) & ((1 << ammo_active_bits) - 1))
+
+    if include_entity_vitals:
+        if ENTITY_VITALS_MODE in ("health", "vitals"):
+            bw.write_bits(10, encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
+        else:
             bw.write_bits(10, compress_value(fuel, 1.0, 1.0, total_bits=10))

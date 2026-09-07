@@ -22,6 +22,7 @@ from .packets import (
     HEALTH_MAX, HEALTH_RANGE,
     ENERGY_MAX, ENERGY_RANGE,
 )
+from .hud_state import HUD_FRACTION_BITS, HUD_FRACTION_MAX, HUD_FRACTION_RANGE
 
 
 @dataclass
@@ -52,8 +53,8 @@ SCALAR_QUANTIZERS = [
     Quantizer(10, "scalar10",      16,  0, 1000.0, 2000.0, "scalar"),
     Quantizer(11, "scalar11",      16,  0, 1000.0, 2000.0, "scalar"),
     Quantizer(12, "scalar12",      16,  0, 1000.0, 2000.0, "scalar"),
-    Quantizer(13, "extra_a",        8,  0,    1.0,    1.0, "scalar"),
-    Quantizer(14, "extra_b",        8,  0,    1.0,    1.0, "scalar"),
+    Quantizer(13, "pulse_charge", HUD_FRACTION_BITS, 0, HUD_FRACTION_MAX, HUD_FRACTION_RANGE, "scalar"),
+    Quantizer(14, "repair_fraction", HUD_FRACTION_BITS, 0, HUD_FRACTION_MAX, HUD_FRACTION_RANGE, "scalar"),
     Quantizer(15, "slot_index",    16,  0, 1000.0, 2000.0, "scalar"),
 ]
 
