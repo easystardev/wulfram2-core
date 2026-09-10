@@ -3379,7 +3379,13 @@ VEHICLE_PHYSICS_CONFIGS = {
         strafe_adjust=69.7,
         max_velocity=80.0,
         low_fuel_level=2000.0,
-        max_altitude=16.0,  # Production BEHAVIOR tank model slot 5, 2026-09-07.
+        # 3.25, NOT the 16.0 read from production BEHAVIOR tank model slot 5 on
+        # 2026-09-07. Slot 5 does hold 16.0, but feeding it here as max_altitude
+        # breaks controller parity: max position drift goes to 15.008658u against
+        # a 1.0u gate, and back to 0.425253u at 3.25. Whatever slot 5 means, it is
+        # not this field. Measured 2026-09-10 via
+        # `python -m wulfram_client.controller_parity_test --max-position-drift 1.0`.
+        max_altitude=3.25,
         gravity_pct=1.0,
     ),
     EntityType.SCOUT: VehiclePhysicsConfig(
