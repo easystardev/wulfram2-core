@@ -364,8 +364,35 @@ def write_update_array_entity(bw,
                               fuel: float = 1.0,
                               ammo_unit: Optional[int] = None,
                               ammo_active_bits: int = 0,
-                              ammo_active_mask: int = 0) -> None:
-    """Write a single entity update block to an UPDATE_ARRAY bitstream."""
+                              ammo_active_mask: int = 0,
+                              include_reset: bool = False) -> None:
+    """Write a single entity update block to an UPDATE_ARRAY bitstream.
+
+    ``include_reset`` sets update-mask bit 9, the death/teleport bit. It is
+    OFF by default and no production path sets it.
+
+    Bit 9 is the client's hard-snap selector. Traced in the pristine image:
+    the 10-bit mask is read by ``MemBuff_read_nbits(payload, 10, &mask)`` at
+    ``0047d889`` inside ``0047d760``; bit 9 reaches ``BL`` in ``0047d2f0``,
+    where ``TEST BL,BL`` / ``JZ`` at ``0047d3e1`` selects between the ordinary
+    wake path (bit clear, ``0047dd2c`` ``RigidBody_wake``) and the direct
+    reset path (bit set, ``0047d3e9`` -> ``0047d670`` ``Entity_reset_physics``).
+    Reaching reset_physics' full side effects rather than its zero-motion
+    fallback additionally needs bits 1 and 3 present in the same record.
+
+    WARNING, and the reason this is opt-in rather than inferred from the other
+    flags: bits 1+3+9 together are the documented client-crash path. The reset
+    routes into an attitude slerp whose ``acos(dot)`` is unclamped, so a
+    sub-epsilon attitude delta yields ``dot`` just above 1.0, ``acos`` = NaN,
+    and a crash -- roughly one time in two on a native ~60 fps client, and
+    almost never on a ~12 fps WARP VM. See ``docs/freeze-correction-arc-2026-07.md``
+    and the project CLAUDE.md. Do not enable this against a host client you
+    care about.
+
+    This exists so the S1 ingress-ownership capture can exercise the reset
+    branch at all: it had fired zero times across a 3,123-record accepted
+    tape, because nothing in this encoder had ever set the bit.
+    """
     bw.write_bits(32, entity_id)
     bw.write_bits(1, 1 if is_manned else 0)
 
@@ -385,6 +412,8 @@ def write_update_array_entity(bw,
         if int(ammo_unit) != 0 or int(ammo_active_bits) != 9:
             raise ValueError("only Tank ammo unit 0 with active width 9 is supported")
         update_mask |= (1 << 6)
+    if include_reset:
+        update_mask |= (1 << 9)
     bw.write_bits(10, update_mask)
 
     bw.write_bits(16, 0)  # Bank selector
