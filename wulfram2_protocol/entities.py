@@ -2784,9 +2784,10 @@ def tank_softbody_suspension_force(
     base_target = max(0.001, float(target_average_height))
     gravity_factor = max(0.0, float(gravity_pct))
 
-    support = max(0.0, float(physics_timestep_factor)) * gravity_factor
-    if support <= 0.0:
-        support = abs(float(gravity)) * gravity_factor
+    gravity_base = max(0.0, float(physics_timestep_factor))
+    if gravity_base <= 0.0:
+        gravity_base = abs(float(gravity))
+    support = gravity_base * gravity_factor
     idle = max(0.001, abs(float(idle_slot5)))
     # Spring_compute_suspension_forces samples the jet/spring curve with
     # stiffness * max_altitude plus shear and force_offset. A direct additive
@@ -2922,7 +2923,10 @@ def tank_softbody_suspension_force(
                 point_count=point_count,
                 rest_height=rest,
                 gravity_pct=gravity_factor,
-                physics_timestep_factor=support,
+                # The original is G + response * gravity_pct * G. Passing
+                # support (G * gravity_pct) here applied the fraction twice
+                # and incorrectly scaled the constant G term as well.
+                physics_timestep_factor=gravity_base,
             )
             height_curve_factor = piecewise_sample.height_curve_factor
             point_input_ratio = point_force_curve_input / idle_force_curve_input
@@ -2971,7 +2975,8 @@ def tank_softbody_suspension_force(
             decompile_slow_reacts.append(float(piecewise_sample.slow_react))
 
         point_lift = sum(vertical_forces)
-        if point_lift > lift_cap and point_lift > 1e-9:
+        # The empirical support cap is not part of the recovered force kernel.
+        if not use_decompile_piecewise_force and point_lift > lift_cap and point_lift > 1e-9:
             scale = lift_cap / point_lift
             forces = [v * scale for v in forces]
             vertical_forces = [v * scale for v in vertical_forces]
@@ -3374,7 +3379,7 @@ VEHICLE_PHYSICS_CONFIGS = {
         strafe_adjust=69.7,
         max_velocity=80.0,
         low_fuel_level=2000.0,
-        max_altitude=3.25,
+        max_altitude=16.0,  # Production BEHAVIOR tank model slot 5, 2026-09-07.
         gravity_pct=1.0,
     ),
     EntityType.SCOUT: VehiclePhysicsConfig(
