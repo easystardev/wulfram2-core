@@ -41,7 +41,7 @@ class PacketType:
     COMM_MESSAGE = 0x1F
     LOGIN_STATUS = 0x22
     MOTD = 0x23
-    REQUEST_START = 0x23  # Legacy alias; older code often calls this MOTD
+    REQUEST_START = 0x23  # Legacy alias kept for importers; the wire name is MOTD (s2c)
     LOGIN_REQUEST = 0x21
     BEHAVIOR = 0x24
     REINCARNATE = 0x25
@@ -121,7 +121,11 @@ PACKET_NAMES = {
     0x20: "CHAT",
     0x21: "LOGIN_REQUEST",
     0x22: "LOGIN_STATUS",
-    0x23: "REQUEST_START",
+    # 0x23 is s2c MOTD (u16 len + string). The OG client registers PacketHandler_MOTD
+    # for 0x23 and no 0x23 encoder (azurefishy Network.c:1530 and its encoder list);
+    # upstream wulfram3.com sends MOTD on it at join (2026-10-16). Same in both
+    # directions: nothing sends 0x23 client->server.
+    0x23: "MOTD",
     0x24: "BEHAVIOR",
     0x25: "REINCARNATE",
     0x26: "RETARGET",
@@ -151,6 +155,13 @@ PACKET_NAMES = {
     0x3F: "RESET_GAME",
     0x40: "INPUT_FEEDBACK",
     0x41: "SHUTDOWN",
+    # Squad range (s2c handlers, azurefishy Network.c:1552-1556). Upstream sends
+    # 0x44 x3 and 0x45 x3 on TCP at join (2026-10-16 capture).
+    0x43: "SQUAD_RESULT",
+    0x44: "SQUAD_DEFINITION",  # OG handler comment: CLAN_INFO
+    0x45: "SQUAD_MEMBER",
+    0x46: "SQUAD_INVITE",
+    0x48: "SQUAD_INVITE_REMOVAL",
     0x4C: "ROUTING_PING",
     0x4D: "IDENTIFIED_UDP",
     0x55: "DEBUG_COORDS",
@@ -365,8 +376,19 @@ def write_update_array_entity(bw,
                               ammo_unit: Optional[int] = None,
                               ammo_active_bits: int = 0,
                               ammo_active_mask: int = 0,
-                              include_reset: bool = False) -> None:
+                              include_reset: bool = False,
+                              include_health: Optional[bool] = None,
+                              include_fuel: Optional[bool] = None,
+                              target_id: Optional[int] = None) -> None:
     """Write a single entity update block to an UPDATE_ARRAY bitstream.
+
+    Mask bits 5-8 (OG reader order): 5 = health (``speed_scale``, 10 bits),
+    6 = ammo block (``ammo_unit``), 7 = energy (``fuel``, 10 bits), 8 = target
+    entity id (u32). ``include_entity_vitals`` sets 5 and 7 together (legacy);
+    ``include_health`` / ``include_fuel`` override each one independently when
+    not None, and a non-None ``target_id`` sets bit 8. Upstream wulfram3.com
+    sends the local tank exactly the dirty subset of these (masks 32/64/128/
+    160/192/224/480 in the 2026-09-18 and 2026-10-16 captures).
 
     ``include_reset`` sets update-mask bit 9, the death/teleport bit. It is
     OFF by default and no production path sets it.
@@ -405,13 +427,18 @@ def write_update_array_entity(bw,
         update_mask |= (1 << 3)
     if include_spin:
         update_mask |= (1 << 4)
-    if include_entity_vitals:
+    write_health = bool(include_entity_vitals) if include_health is None else bool(include_health)
+    write_fuel = bool(include_entity_vitals) if include_fuel is None else bool(include_fuel)
+    if write_health:
         update_mask |= (1 << 5)
+    if write_fuel:
         update_mask |= (1 << 7)
     if ammo_unit is not None:
         if int(ammo_unit) != 0 or int(ammo_active_bits) != 9:
             raise ValueError("only Tank ammo unit 0 with active width 9 is supported")
         update_mask |= (1 << 6)
+    if target_id is not None:
+        update_mask |= (1 << 8)
     if include_reset:
         update_mask |= (1 << 9)
     bw.write_bits(10, update_mask)
@@ -438,7 +465,7 @@ def write_update_array_entity(bw,
         for v in spin:
             bw.write_bits(16, compress_value(v, VEC_SPIN_MAX, VEC_SPIN_RANGE, total_bits=16))
 
-    if include_entity_vitals:
+    if write_health:
         if ENTITY_VITALS_MODE in ("health", "vitals"):
             bw.write_bits(10, encode_health_bits(speed_scale, total_bits=10))
         else:
@@ -452,8 +479,11 @@ def write_update_array_entity(bw,
         if ammo_active_bits:
             bw.write_bits(ammo_active_bits, int(ammo_active_mask) & ((1 << ammo_active_bits) - 1))
 
-    if include_entity_vitals:
+    if write_fuel:
         if ENTITY_VITALS_MODE in ("health", "vitals"):
             bw.write_bits(10, encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
         else:
             bw.write_bits(10, compress_value(fuel, 1.0, 1.0, total_bits=10))
+
+    if target_id is not None:
+        bw.write_bits(32, int(target_id) & 0xFFFFFFFF)
