@@ -241,6 +241,15 @@ class VehiclePhysicsConfig:
     max_altitude: float     # max hover height
     gravity_pct: float      # gravity multiplier (1.0 = normal)
     max_fuel: float = 33000.0
+    # legacy (original wulfram2.exe): the medic/scout block has its own reverse
+    # thrust slot (+0x20, MedicVehicle_apply_physics uses it when throttle <= 0).
+    # None => reverse with move_adjust, which is the tank behaviour (the OG tank
+    # block has no backward slot).
+    move_backward_adjust: float | None = None
+    # legacy (original wulfram2.exe): forward-speed cap as a multiple of
+    # move_adjust. Tank caps at move_adjust (1.0); the OG medic/scout caps at
+    # move_forward * 1.25.
+    move_cap_scale: float = 1.0
 
     # Runtime physics
     linear_damping_driving: float = 1.5   # active PhysicsConfig linear damping
@@ -3388,16 +3397,37 @@ VEHICLE_PHYSICS_CONFIGS = {
         max_altitude=3.25,
         gravity_pct=1.0,
     ),
+    # legacy (original wulfram2.exe): VehiclePhysics_init_medic @ 0x004f6690
+    # literals, 9-slot layout turn / move_forward / move_backward / strafe /
+    # max_velocity / low_fuel / max_altitude / max_speed_height_pickup /
+    # gravity_perc = 4.5 / 85 / 38 / 72 / 85 / 2000 / 4.9 / 3.5 / 1.0.
+    # Max fuel 13000 is the GUESS5_EntityParams_create scout override.
+    # (Before 2026-10-17 this read the 9-slot block with the tank's 7-slot
+    # meanings: strafe 38 / max_velocity 72, one slot off.)
     EntityType.SCOUT: VehiclePhysicsConfig(
         turn_adjust=4.5,
         move_adjust=85.0,
-        strafe_adjust=38.0,
-        max_velocity=72.0,
+        strafe_adjust=72.0,
+        max_velocity=85.0,
         low_fuel_level=2000.0,
         max_altitude=4.9,
         gravity_pct=1.0,
+        max_fuel=13000.0,
+        move_backward_adjust=38.0,
+        move_cap_scale=1.25,
     ),
 }
+
+
+def vehicle_max_fuel(entity_type) -> float:
+    """Per-vehicle max fuel (EntityParams+0x34): tank 33000, scout 13000.
+
+    Unknown types fall back to the tank value.
+    """
+    cfg = VEHICLE_PHYSICS_CONFIGS.get(entity_type)
+    if cfg is None:
+        cfg = VEHICLE_PHYSICS_CONFIGS[EntityType.TANK]
+    return float(cfg.max_fuel)
 
 
 class EntityPhysicsMode(IntEnum):
